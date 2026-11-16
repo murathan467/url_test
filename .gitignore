@@ -8,6 +8,7 @@ error_log.txt
 debug_*.png
 *_storage_state.json
 *_storage_state.b64
+.session_cache/
 *_cookies.json
 zara/zara_cookies.json
 mango/mango_cookies.json

@@ -1,0 +1,100 @@
+name: Zara, Mango & Oxxo Takip Botu
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  track-store:
+    name: ${{ matrix.store_upper }} Takip
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - store: zara
+            store_upper: ZARA
+          - store: mango
+            store_upper: MANGO
+          - store: oxxo
+            store_upper: OXXO
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Xvfb ve Patchright kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install -r requirements.txt
+          patchright install chromium
+          patchright install-deps chromium
+
+      - name: Sifreli oturum onbellegini geri yukle
+        uses: actions/cache/restore@v4
+        with:
+          path: .session_cache/${{ matrix.store }}.enc
+          key: session-${{ matrix.store }}-${{ github.run_id }}
+          restore-keys: |
+            session-${{ matrix.store }}-
+
+      - name: Oturum dosyasini hazirla
+        env:
+          STORE_STATE: ${{ secrets[format('{0}_STORAGE_STATE', matrix.store_upper)] }}
+          COMMON_PASSWORD: ${{ secrets.COMMON_PASSWORD }}
+        run: |
+          mkdir -p .session_cache
+          if [ -s ".session_cache/${{ matrix.store }}.enc" ] && [ -n "$COMMON_PASSWORD" ]; then
+            if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:COMMON_PASSWORD \
+              -in ".session_cache/${{ matrix.store }}.enc" \
+              -out "${{ matrix.store }}_storage_state.json" 2>/dev/null; then
+              echo "Onbellekten sifreli oturum cozuldu."
+            else
+              rm -f "${{ matrix.store }}_storage_state.json"
+            fi
+          fi
+          if [ ! -s "${{ matrix.store }}_storage_state.json" ] && [ -n "$STORE_STATE" ]; then
+            echo "$STORE_STATE" | tr -d '\r\n' | base64 --decode > "${{ matrix.store }}_storage_state.json"
+            echo "Secret icinden oturum yuklendi."
+          fi
+
+      - name: Botu sanal ekranda calistir
+        env:
+          COMMON_EMAIL: ${{ secrets.COMMON_EMAIL }}
+          COMMON_PASSWORD: ${{ secrets.COMMON_PASSWORD }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_RUN_MINUTES: ${{ vars.MAX_RUN_MINUTES || '345' }}
+          REFRESH_INTERVAL: ${{ vars.REFRESH_INTERVAL || '30' }}
+          MAX_ALERTS_PER_WAVE: ${{ vars.MAX_ALERTS_PER_WAVE || '3' }}
+          TARGET_SIZES: ${{ vars.TARGET_SIZES || 'S,XS,34,36' }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python main_bot.py --store "${{ matrix.store }}"
+
+      - name: Guncel oturumu sifrele
+        id: encrypt
+        if: always()
+        env:
+          COMMON_PASSWORD: ${{ secrets.COMMON_PASSWORD }}
+        run: |
+          mkdir -p .session_cache
+          if [ -s "${{ matrix.store }}_storage_state.json" ] && [ -n "$COMMON_PASSWORD" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -pass env:COMMON_PASSWORD \
+              -in "${{ matrix.store }}_storage_state.json" \
+              -out ".session_cache/${{ matrix.store }}.enc"
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sifreli oturumu onbellege kaydet
+        if: always() && steps.encrypt.outputs.has_cache == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .session_cache/${{ matrix.store }}.enc
+          key: session-${{ matrix.store }}-${{ github.run_id }}
