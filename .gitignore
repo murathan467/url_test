@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+.env
+*.log
+error_log.txt
+debug_*.png
+*_storage_state.json
+*_storage_state.b64
+*_cookies.json
+zara/zara_cookies.json
+mango/mango_cookies.json
+oxxo/oxxo_cookies.json
+zara/zara_chrome_profile/
