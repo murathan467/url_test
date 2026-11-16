@@ -60,8 +60,38 @@ jobs:
             fi
           fi
           if [ ! -s "${{ matrix.store }}_storage_state.json" ] && [ -n "$STORE_STATE" ]; then
-            echo "$STORE_STATE" | tr -d '\r\n' | base64 --decode > "${{ matrix.store }}_storage_state.json"
-            echo "Secret icinden oturum yuklendi."
+            python3 - "${{ matrix.store }}_storage_state.json" << 'EOF'
+          import base64
+          import json
+          import os
+          import sys
+
+          out_path = sys.argv[1]
+          raw = os.environ.get("STORE_STATE", "").strip()
+          if raw:
+              parsed = None
+              try:
+                  parsed = json.loads(raw)
+              except Exception:
+                  try:
+                      cleaned = "".join(raw.split())
+                      cleaned += "=" * (-len(cleaned) % 4)
+                      decoded = base64.b64decode(cleaned, validate=True).decode("utf-8")
+                      parsed = json.loads(decoded)
+                  except Exception:
+                      parsed = None
+
+              if isinstance(parsed, dict) and "cookies" in parsed:
+                  with open(out_path, "w", encoding="utf-8") as f:
+                      json.dump(parsed, f, ensure_ascii=False)
+                  print("Secret icinden oturum yuklendi.")
+              elif isinstance(parsed, list):
+                  with open(out_path, "w", encoding="utf-8") as f:
+                      json.dump({"cookies": parsed, "origins": []}, f, ensure_ascii=False)
+                  print("Secret icinden cerez listesi donusturulup yuklendi.")
+              else:
+                  print("UYARI: *_STORAGE_STATE secret icerigi gecerli JSON veya Base64 degil; otomatik girisle devam edilecek.")
+          EOF
           fi
 
       - name: Botu sanal ekranda calistir
