@@ -1,6 +1,8 @@
 import asyncio
+import json
 import time
-from patchright.async_api import BrowserContext, Page
+from collections.abc import Callable
+from patchright.async_api import BrowserContext, Page, Response
 from config import (
     COMMON_EMAIL,
     COMMON_PASSWORD,
@@ -132,16 +134,151 @@ async def _is_zara_session_active(page: Page, state: dict) -> bool:
     )
 
 
+def _summarize_json_payload(raw_text: str) -> str:
+    """Summarize JSON structure using only top-level keys and container lengths (no values)."""
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        return "json_parse_err"
+
+    if isinstance(data, dict):
+        keys = list(data.keys())[:10]
+        sizes = [
+            f"{k}:{len(v)}"
+            for k, v in data.items()
+            if isinstance(v, (list, dict))
+        ][:8]
+        return f"keys={keys} lens={{{','.join(sizes)}}}"
+    if isinstance(data, list):
+        first_keys = list(data[0].keys())[:10] if data and isinstance(data[0], dict) else []
+        return f"list_len={len(data)} item_keys={first_keys}"
+    return f"type={type(data).__name__}"
+
+
+def _attach_zara_network_logger(page: Page) -> tuple[list[str], Callable[[], None]]:
+    """Attach a bounded, secret-free response logger for Zara wishlist/API calls."""
+    logs: list[str] = []
+    state = {"active": True}
+    static_exts = (".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".woff", ".woff2", ".ico", ".map")
+    interesting = ("wishlist", "itxrest", "/lists", "saved", "favorite")
+
+    async def _on_response(resp: Response) -> None:
+        if not state["active"] or len(logs) >= 25:
+            return
+        try:
+            path = resp.url.split("?")[0]
+            lower_path = path.lower()
+            if lower_path.endswith(static_exts):
+                return
+            if not any(tok in lower_path for tok in interesting):
+                return
+
+            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            size_hdr = resp.headers.get("content-length") or "?"
+            if "json" in ct and resp.status < 400:
+                try:
+                    body = await resp.text()
+                    preview = _summarize_json_payload(body)
+                    logs.append(f"{resp.status} {path} ct={ct} len={len(body)} {preview}")
+                    return
+                except Exception:
+                    pass
+            logs.append(f"{resp.status} {path} ct={ct or '-'} len={size_hdr}")
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+
+    def _stop() -> None:
+        if state["active"]:
+            state["active"] = False
+            try:
+                page.remove_listener("response", _on_response)
+            except Exception:
+                pass
+
+    return logs, _stop
+
+
+async def _zara_dom_diagnostics(page: Page) -> str:
+    """Return concise <main> DOM metrics, data-qa attributes, links, and shadow root status."""
+    try:
+        info = await page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('main, [role="main"]') || document.body;
+                if (!root) return { err: "no_root" };
+                const counts = {
+                    a: root.querySelectorAll('a').length,
+                    li: root.querySelectorAll('li').length,
+                    article: root.querySelectorAll('article').length,
+                    button: root.querySelectorAll('button').length,
+                    img: root.querySelectorAll('img').length,
+                    iframe: root.querySelectorAll('iframe').length,
+                    productid: root.querySelectorAll('[data-productid]').length,
+                };
+                const qaSet = new Set();
+                root.querySelectorAll('[data-qa-qualifier], [data-qa-id], [data-qa-action]').forEach(el => {
+                    if (qaSet.size >= 15) return;
+                    const v = el.getAttribute('data-qa-qualifier')
+                           || el.getAttribute('data-qa-id')
+                           || el.getAttribute('data-qa-action');
+                    if (v) qaSet.add(v);
+                });
+                const hrefs = [];
+                const seenH = new Set();
+                root.querySelectorAll('a[href]').forEach(a => {
+                    if (hrefs.length >= 8) return;
+                    const h = (a.getAttribute('href') || '').split('?')[0];
+                    if (h && !seenH.has(h)) {
+                        seenH.add(h);
+                        hrefs.push(h);
+                    }
+                });
+                let shadowHosts = 0;
+                root.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) shadowHosts += 1;
+                });
+                const text = (root.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 400);
+                return {
+                    root_tag: root.tagName.toLowerCase(),
+                    counts,
+                    qa: [...qaSet],
+                    hrefs,
+                    shadow_hosts: shadowHosts,
+                    text,
+                };
+            }
+            """
+        )
+        return (
+            f"root={info.get('root_tag')} counts={info.get('counts')} "
+            f"shadow_hosts={info.get('shadow_hosts')} qa={info.get('qa')} "
+            f"hrefs={info.get('hrefs')} text={info.get('text')}"
+        )
+    except Exception as exc:
+        return f"dom_diag_err={exc}"
+
+
 async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
     """Verify Zara session on wishlist or perform login via home -> logon."""
+    net_logs, stop_net_logger = _attach_zara_network_logger(page)
     try:
         await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
         await page.wait_for_timeout(4000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
         await handle_country_and_cookies(page)
 
         if "/tr/tr" not in (page.url or "").lower():
             await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
             await page.wait_for_timeout(3500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
             await handle_country_and_cookies(page)
 
         diag = await page_diagnostics(page)
@@ -151,6 +288,9 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             f"wishlist={state['is_wishlist_url']} urun_link={state['total_product_links']} "
             f"login_form={state['has_login_form']} login_cta={state['has_login_cta_in_main']}"
         )
+        if state["total_product_links"] == 0:
+            print(f"[Zara] DOM teşhis -> {await _zara_dom_diagnostics(page)}")
+            print(f"[Zara] Ağ teşhis ({len(net_logs)} yanıt) -> {net_logs}")
 
         if await _is_zara_session_active(page, state):
             print("[Zara] ✅ Kayıtlı oturum aktif, doğrudan favorilere girildi.")
@@ -159,6 +299,8 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
     except Exception as exc:
         print(f"[HATA] Zara başlangıç oturum kontrolü hatası: {exc}")
         return False
+    finally:
+        stop_net_logger()
 
     if not COMMON_EMAIL or not COMMON_PASSWORD:
         print("[HATA] COMMON_EMAIL veya COMMON_PASSWORD eksik.")
@@ -392,43 +534,32 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
     max_seconds = max_run_minutes * 60 if max_run_minutes > 0 else float("inf")
     cycle = 0
     sem = asyncio.Semaphore(4)
+    loop_net_logs, stop_loop_net_logger = _attach_zara_network_logger(favorites_page)
 
-    while (time.time() - start_time) < max_seconds:
-        cycle += 1
-        print(f"\n[ZARA — Tur #{cycle}] Favoriler yenileniyor...")
+    try:
+        while (time.time() - start_time) < max_seconds:
+            cycle += 1
+            if cycle <= 2:
+                loop_net_logs.clear()
+            print(f"\n[ZARA — Tur #{cycle}] Favoriler yenileniyor...")
 
-        if cycle > 1:
-            if not await safe_reload_or_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=30000):
-                await asyncio.sleep(REFRESH_INTERVAL)
-                continue
-            await favorites_page.wait_for_timeout(3500)
-
-        await handle_country_and_cookies(favorites_page)
-
-        if await has_block_or_captcha(favorites_page):
-            print(f"[UYARI] Zara geçici engeli algılandı, {ERROR_COOLDOWN} sn bekleniyor...")
-            await asyncio.sleep(ERROR_COOLDOWN)
-            continue
-
-        current_url = (favorites_page.url or "").lower()
-        if "logon" in current_url or "login" in current_url:
-            print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
-            if not await ensure_zara_login(context, favorites_page):
-                send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
-                return False
-
-        if "/tr/tr" not in current_url or not any(
-            k in current_url for k in ("wishlist", "lists", "saved")
-        ):
-            print("[UYARI] Zara favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
-            try:
-                await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
+            if cycle > 1:
+                if not await safe_reload_or_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=30000):
+                    await asyncio.sleep(REFRESH_INTERVAL)
+                    continue
                 await favorites_page.wait_for_timeout(3500)
-                await handle_country_and_cookies(favorites_page)
-            except Exception as exc:
-                print(f"[HATA] Zara favorilere dönülemedi: {exc}")
-                await asyncio.sleep(REFRESH_INTERVAL)
+                try:
+                    await favorites_page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    pass
+
+            await handle_country_and_cookies(favorites_page)
+
+            if await has_block_or_captcha(favorites_page):
+                print(f"[UYARI] Zara geçici engeli algılandı, {ERROR_COOLDOWN} sn bekleniyor...")
+                await asyncio.sleep(ERROR_COOLDOWN)
                 continue
+
             current_url = (favorites_page.url or "").lower()
             if "logon" in current_url or "login" in current_url:
                 print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
@@ -436,34 +567,58 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
                     send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
                     return False
 
-        await scroll_page_to_bottom(favorites_page)
+            if "/tr/tr" not in current_url or not any(
+                k in current_url for k in ("wishlist", "lists", "saved")
+            ):
+                print("[UYARI] Zara favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
+                try:
+                    await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
+                    await favorites_page.wait_for_timeout(3500)
+                    await handle_country_and_cookies(favorites_page)
+                except Exception as exc:
+                    print(f"[HATA] Zara favorilere dönülemedi: {exc}")
+                    await asyncio.sleep(REFRESH_INTERVAL)
+                    continue
+                current_url = (favorites_page.url or "").lower()
+                if "logon" in current_url or "login" in current_url:
+                    print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
+                    if not await ensure_zara_login(context, favorites_page):
+                        send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
+                        return False
 
-        extracted = await _extract_stock_and_discounted_items(favorites_page)
-        total = extracted.get("total", 0)
-        in_stock = extracted.get("in_stock", 0)
-        candidates = extracted.get("items", [])
-        print(
-            f"[Zara] Favorilerde toplam {total} ürün tarandı "
-            f"(stokta: {in_stock}, stokta+indirimde: {len(candidates)})."
-        )
-        if cycle == 1 and total == 0:
-            print(f"[Zara] İlk tur 0 ürün teşhisi -> {await page_diagnostics(favorites_page)}")
+            await scroll_page_to_bottom(favorites_page)
 
-        matched_items: list[dict] = []
-        if candidates:
-            results = await asyncio.gather(
-                *[_open_and_check_tab(context, prod, sem) for prod in candidates]
+            extracted = await _extract_stock_and_discounted_items(favorites_page)
+            total = extracted.get("total", 0)
+            in_stock = extracted.get("in_stock", 0)
+            candidates = extracted.get("items", [])
+            print(
+                f"[Zara] Favorilerde toplam {total} ürün tarandı "
+                f"(stokta: {in_stock}, stokta+indirimde: {len(candidates)})."
             )
-            matched_items = [r for r in results if r is not None]
+            if cycle in (1, 2) and total == 0:
+                print(f"[Zara] Tur #{cycle} DOM teşhis -> {await _zara_dom_diagnostics(favorites_page)}")
+                print(f"[Zara] Tur #{cycle} Ağ teşhis ({len(loop_net_logs)} yanıt) -> {loop_net_logs}")
+            if cycle >= 2:
+                stop_loop_net_logger()
 
-        notifier.process_cycle(matched_items)
-        await save_store_session(context, "zara", mark_valid=True)
+            matched_items: list[dict] = []
+            if candidates:
+                results = await asyncio.gather(
+                    *[_open_and_check_tab(context, prod, sem) for prod in candidates]
+                )
+                matched_items = [r for r in results if r is not None]
 
-        remaining = max_seconds - (time.time() - start_time)
-        if remaining <= REFRESH_INTERVAL:
-            break
+            notifier.process_cycle(matched_items)
+            await save_store_session(context, "zara", mark_valid=True)
 
-        print(f"[Zara] Tarama tamamlandı. {REFRESH_INTERVAL} sn bekleniyor...")
-        await asyncio.sleep(REFRESH_INTERVAL)
+            remaining = max_seconds - (time.time() - start_time)
+            if remaining <= REFRESH_INTERVAL:
+                break
+
+            print(f"[Zara] Tarama tamamlandı. {REFRESH_INTERVAL} sn bekleniyor...")
+            await asyncio.sleep(REFRESH_INTERVAL)
+    finally:
+        stop_loop_net_logger()
 
     return True

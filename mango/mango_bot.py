@@ -55,10 +55,24 @@ async def handle_country_and_cookies(page: Page) -> None:
 
 
 async def has_block_or_captcha(page: Page) -> bool:
-    """Detect WAF blocks or CAPTCHA iframes without bypassing them."""
+    """Detect WAF/Vercel security checkpoints or CAPTCHA iframes without bypassing them."""
+    block_markers = (
+        "access denied",
+        "attention required",
+        "vercel security checkpoint",
+        "vercel güvenlik kontrol noktası",
+        "tarayıcınız doğrulanamadı",
+        "failed to verify your browser",
+    )
+    try:
+        title = (await page.title() or "").lower()
+        if any(k in title for k in block_markers):
+            return True
+    except Exception:
+        pass
     try:
         text = (await page.locator("body").inner_text(timeout=2500)).lower()
-        if any(k in text for k in ["access denied", "attention required"]):
+        if any(k in text for k in block_markers):
             return True
         captcha_count = await page.locator(
             "iframe[src*='captcha'], iframe[src*='arkose'], iframe[title*='reCAPTCHA'], #sec-overlay"
@@ -157,7 +171,7 @@ async def ensure_mango_login(context: BrowserContext, page: Page) -> bool:
         await handle_country_and_cookies(page)
 
         if await has_block_or_captcha(page):
-            print("[HATA] Mango giriş sayfasında Captcha/WAF engeli çıktı.")
+            print("[HATA] Mango giriş sayfasında Captcha/WAF/Vercel engeli çıktı.")
             return False
 
         email_input = page.locator("input[id='login-form-email-input'], input[type='email']").first
@@ -370,7 +384,7 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
     """Run Mango favorites polling loop with bounded concurrent discount + size checks."""
     favorites_page = await context.new_page()
     if not await ensure_mango_login(context, favorites_page):
-        send_telegram_message("🚨 Mango oturumu açılamadı (Captcha/Login engeli).")
+        send_telegram_message("🚨 Mango oturumu açılamadı (Captcha/WAF/Vercel engeli).")
         return False
 
     notifier = StockWaveNotifier("MANGO")
