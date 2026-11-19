@@ -11,7 +11,14 @@ from config import (
     ZARA_HOME_URL,
     ZARA_LOGIN_URL,
 )
-from core.browser import click_first_visible, human_type, scroll_page_to_bottom
+from core.browser import (
+    click_first_visible,
+    human_type,
+    page_diagnostics,
+    safe_goto,
+    safe_reload_or_goto,
+    scroll_page_to_bottom,
+)
 from core.notifier import StockWaveNotifier, send_telegram_message
 from core.session import save_store_session
 
@@ -20,14 +27,17 @@ async def handle_country_and_cookies(page: Page) -> None:
     """Close Zara country selection modal, cookie banner, and error dialogs."""
     country_selectors = [
         "button[data-qa-action='stay-in-store']",
-        "button[data-qa-action='go-to-store']",
-        "button:has-text('Türkiye')",
-        "button:has-text('TÜRKİYE')",
-        "button:has-text('DEVAM ET')",
-        "button:has-text('Continue to Turkey')",
+        "[role='dialog'] button[data-qa-action='stay-in-store']",
+        "[role='dialog'] button:has-text('Türkiye')",
+        "[role='dialog'] button:has-text('TÜRKİYE')",
+        "[role='dialog'] button:has-text('Continue to Turkey')",
+        "[role='dialog'] button:has-text('Türkiye mağazasında kal')",
     ]
-    if await click_first_visible(page, country_selectors, timeout_ms=2000, post_wait_ms=1500):
-        print("[Zara] Türkiye mağaza seçimi onaylandı.")
+    matched_country = await click_first_visible(
+        page, country_selectors, timeout_ms=2000, post_wait_ms=1500
+    )
+    if matched_country:
+        print(f"[Zara] Türkiye mağaza seçimi onaylandı ({matched_country}).")
 
     cookie_selectors = [
         "#onetrust-accept-btn-handler",
@@ -36,8 +46,11 @@ async def handle_country_and_cookies(page: Page) -> None:
         "button:has-text('Tüm çerezleri kabul et')",
         "button:has-text('ACCEPT ALL')",
     ]
-    if await click_first_visible(page, cookie_selectors, timeout_ms=2000, post_wait_ms=1000):
-        print("[Zara] Çerezler kabul edildi.")
+    matched_cookie = await click_first_visible(
+        page, cookie_selectors, timeout_ms=2000, post_wait_ms=1000
+    )
+    if matched_cookie:
+        print(f"[Zara] Çerezler kabul edildi ({matched_cookie}).")
 
     error_dialog_selectors = [
         "[role='dialog'] button:has-text('OK')",
@@ -45,8 +58,11 @@ async def handle_country_and_cookies(page: Page) -> None:
         "[role='dialog'] button:has-text('Tamam')",
         "[role='dialog'] button:has-text('TAMAM')",
     ]
-    if await click_first_visible(page, error_dialog_selectors, timeout_ms=1000, post_wait_ms=1000):
-        print("[Zara] Hata diyaloğu kapatıldı.")
+    matched_dialog = await click_first_visible(
+        page, error_dialog_selectors, timeout_ms=1000, post_wait_ms=1000
+    )
+    if matched_dialog:
+        print(f"[Zara] Hata diyaloğu kapatıldı ({matched_dialog}).")
 
 
 async def has_block_or_captcha(page: Page) -> bool:
@@ -65,17 +81,84 @@ async def has_block_or_captcha(page: Page) -> bool:
     return False
 
 
+async def _inspect_zara_page(page: Page) -> dict:
+    """Inspect current Zara page URL, product links, login form, and main login CTA state."""
+    has_login_form = False
+    try:
+        has_login_form = await page.locator(
+            "input[name='email'], input[name='logonId'], input[name='password'], "
+            "input[type='email'], input[type='password']"
+        ).first.is_visible(timeout=500)
+    except Exception:
+        pass
+
+    info = await page.evaluate(
+        """
+        () => {
+            const url = (window.location.href || "").toLowerCase();
+            const links = document.querySelectorAll('a[href*="-p"]');
+            const seen = new Set();
+            links.forEach(a => {
+                if (a.href && /-p\\d{4,}\\.html($|\\?)/.test(a.href)) {
+                    seen.add(a.href);
+                }
+            });
+            const mainEl = document.querySelector('main, [role="main"]') || document.body;
+            const mainText = mainEl ? (mainEl.innerText || "").toLowerCase() : "";
+            const hasCtaWords = ["giriş yap", "oturum aç", "log in", "sign in"].some(k => mainText.includes(k));
+            return {
+                is_tr_store: url.includes("/tr/tr"),
+                is_wishlist_url: ["wishlist", "lists", "saved"].some(k => url.includes(k)),
+                has_login_url: url.includes("logon") || url.includes("login"),
+                total_product_links: seen.size,
+                has_login_cta_in_main: seen.size === 0 && hasCtaWords
+            };
+        }
+        """
+    )
+    info["has_login_form"] = has_login_form
+    return info
+
+
+async def _is_zara_session_active(page: Page, state: dict) -> bool:
+    """Return True when page is verified on TR Zara wishlist without login or block screens."""
+    return (
+        not state["has_login_url"]
+        and not state["has_login_form"]
+        and not state["has_login_cta_in_main"]
+        and state["is_tr_store"]
+        and state["is_wishlist_url"]
+        and not await has_block_or_captcha(page)
+    )
+
+
 async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
     """Verify Zara session on wishlist or perform login via home -> logon."""
-    await page.goto(ZARA_FAVORITES_URL, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3500)
-    await handle_country_and_cookies(page)
+    try:
+        await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
+        await page.wait_for_timeout(4000)
+        await handle_country_and_cookies(page)
 
-    current_url = page.url.lower()
-    if "logon" not in current_url and "login" not in current_url and not await has_block_or_captcha(page):
-        print("[Zara] ✅ Kayıtlı oturum aktif, doğrudan favorilere girildi.")
-        await save_store_session(context, "zara")
-        return True
+        if "/tr/tr" not in (page.url or "").lower():
+            await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
+            await page.wait_for_timeout(3500)
+            await handle_country_and_cookies(page)
+
+        diag = await page_diagnostics(page)
+        state = await _inspect_zara_page(page)
+        print(
+            f"[Zara] İlk sayfa kontrolü -> {diag} | tr={state['is_tr_store']} "
+            f"wishlist={state['is_wishlist_url']} urun_link={state['total_product_links']} "
+            f"login_form={state['has_login_form']} login_cta={state['has_login_cta_in_main']}"
+        )
+
+        if await _is_zara_session_active(page, state):
+            print("[Zara] ✅ Kayıtlı oturum aktif, doğrudan favorilere girildi.")
+            await save_store_session(context, "zara", mark_valid=True)
+            return True
+    except Exception as exc:
+        print(f"[HATA] Zara başlangıç oturum kontrolü hatası: {exc}")
+        return False
 
     if not COMMON_EMAIL or not COMMON_PASSWORD:
         print("[HATA] COMMON_EMAIL veya COMMON_PASSWORD eksik.")
@@ -83,7 +166,7 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
 
     print("[Zara] Oturum kapalı, otomatik giriş başlatılıyor...")
     try:
-        await page.goto(ZARA_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+        await safe_goto(page, ZARA_HOME_URL, timeout_ms=30000, retries=2)
         await page.wait_for_timeout(3000)
         await handle_country_and_cookies(page)
 
@@ -92,9 +175,9 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             if await login_link.is_visible(timeout=4000):
                 await login_link.click()
             else:
-                await page.goto(ZARA_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+                await safe_goto(page, ZARA_LOGIN_URL, timeout_ms=30000, retries=2)
         except Exception:
-            await page.goto(ZARA_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            await safe_goto(page, ZARA_LOGIN_URL, timeout_ms=30000, retries=2)
 
         await page.wait_for_timeout(3500)
         await handle_country_and_cookies(page)
@@ -142,30 +225,36 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
         ).first.click()
         await page.wait_for_timeout(6000)
 
-        await page.goto(ZARA_FAVORITES_URL, wait_until="domcontentloaded", timeout=30000)
+        await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
         await page.wait_for_timeout(3500)
         await handle_country_and_cookies(page)
 
-        current_url = page.url.lower()
-        if "logon" in current_url or "login" in current_url or await has_block_or_captcha(page):
-            print("[HATA] Zara girişi tamamlanamadı.")
+        if "/tr/tr" not in (page.url or "").lower():
+            await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
+            await page.wait_for_timeout(3500)
+            await handle_country_and_cookies(page)
+
+        post_state = await _inspect_zara_page(page)
+        if not await _is_zara_session_active(page, post_state):
+            print(f"[HATA] Zara girişi tamamlanamadı -> {await page_diagnostics(page)}")
             return False
 
         print("[Zara] ✅ Otomatik giriş başarılı!")
-        await save_store_session(context, "zara")
+        await save_store_session(context, "zara", mark_valid=True)
         return True
     except Exception as exc:
         print(f"[HATA] Zara login hatası: {exc}")
         return False
 
 
-async def _extract_stock_and_discounted_items(page: Page) -> list[dict]:
-    """Return Zara wishlist items that appear both in stock and discounted."""
+async def _extract_stock_and_discounted_items(page: Page) -> dict:
+    """Return Zara wishlist totals and items that appear both in stock and discounted."""
     return await page.evaluate(
         """
         () => {
             const results = [];
             const seenUrls = new Set();
+            let inStockCount = 0;
             const links = document.querySelectorAll('a[href*="-p"]');
 
             links.forEach(link => {
@@ -190,6 +279,7 @@ async def _extract_stock_and_discounted_items(page: Page) -> list[dict]:
                     cardText.includes("COMING SOON")
                 );
                 if (!hasStock) return;
+                inStockCount += 1;
 
                 let oldPrice = "";
                 let newPrice = "";
@@ -216,101 +306,102 @@ async def _extract_stock_and_discounted_items(page: Page) -> list[dict]:
                 }
             });
 
-            return results;
+            return { total: seenUrls.size, in_stock: inStockCount, items: results };
         }
         """
     )
 
 
-async def _open_and_check_tab(context: BrowserContext, product: dict) -> dict | None:
-    """Open product page in a new tab concurrently and check TARGET_SIZES availability."""
+async def _open_and_check_tab(
+    context: BrowserContext, product: dict, sem: asyncio.Semaphore
+) -> dict | None:
+    """Open product page in a new tab (bounded by sem) and check TARGET_SIZES availability."""
     target_upper = [str(s).upper() for s in TARGET_SIZES]
-    tab = await context.new_page()
-    try:
-        await tab.goto(product["url"], wait_until="domcontentloaded", timeout=30000)
-        await tab.wait_for_timeout(2200)
-
+    async with sem:
+        tab = await context.new_page()
         try:
-            add_btn = tab.locator("button:has-text('EKLE'), button:has-text('ADD')").first
-            if await add_btn.is_visible(timeout=1200):
-                await add_btn.click()
-                await tab.wait_for_timeout(1000)
-        except Exception:
-            pass
+            await safe_goto(tab, product["url"], timeout_ms=30000, retries=2)
+            await tab.wait_for_timeout(2200)
 
-        sizes = await tab.evaluate(
-            """
-            (targetSizes) => {
-                const found = [];
-                const buttons = document.querySelectorAll(
-                    'button.size-selector-sizes-size__button, li.size-selector-list__item, button[data-qa-action*="size"]'
-                );
-                buttons.forEach(btn => {
-                    const txt = btn.innerText.trim().toUpperCase();
-                    const isOut = txt.includes("TÜKENDİ") || txt.includes("BENZER") ||
-                                  txt.includes("COMING SOON") || btn.hasAttribute("disabled") ||
-                                  btn.getAttribute("data-qa-action") === "size-out-of-stock" ||
-                                  (btn.className && btn.className.includes("out-of-stock"));
-                    if (!isOut) {
-                        let sizeName = txt.split("\\n")[0].trim();
-                        const lbl = btn.querySelector(".size-selector-sizes-size__label-content");
-                        if (lbl) sizeName = lbl.innerText.trim().toUpperCase();
+            try:
+                add_btn = tab.locator("button:has-text('EKLE'), button:has-text('ADD')").first
+                if await add_btn.is_visible(timeout=1200):
+                    await add_btn.click()
+                    await tab.wait_for_timeout(1000)
+            except Exception:
+                pass
 
-                        for (const t of targetSizes) {
-                            if (new RegExp("\\\\b" + t + "\\\\b", "i").test(sizeName)) {
-                                found.push(t);
-                                break;
+            sizes = await tab.evaluate(
+                """
+                (targetSizes) => {
+                    const found = [];
+                    const buttons = document.querySelectorAll(
+                        'button.size-selector-sizes-size__button, li.size-selector-list__item, button[data-qa-action*="size"]'
+                    );
+                    buttons.forEach(btn => {
+                        const txt = btn.innerText.trim().toUpperCase();
+                        const isOut = txt.includes("TÜKENDİ") || txt.includes("BENZER") ||
+                                      txt.includes("COMING SOON") || btn.hasAttribute("disabled") ||
+                                      btn.getAttribute("data-qa-action") === "size-out-of-stock" ||
+                                      (btn.className && btn.className.includes("out-of-stock"));
+                        if (!isOut) {
+                            let sizeName = txt.split("\\n")[0].trim();
+                            const lbl = btn.querySelector(".size-selector-sizes-size__label-content");
+                            if (lbl) sizeName = lbl.innerText.trim().toUpperCase();
+
+                            for (const t of targetSizes) {
+                                if (new RegExp("\\\\b" + t + "\\\\b", "i").test(sizeName)) {
+                                    found.push(t);
+                                    break;
+                                }
                             }
                         }
-                    }
-                });
-                return [...new Set(found)];
-            }
-            """,
-            target_upper,
-        ) or []
+                    });
+                    return [...new Set(found)];
+                }
+                """,
+                target_upper,
+            ) or []
 
-        if sizes:
-            item = dict(product)
-            item["available_sizes"] = sizes
-            print(f"  ✅ {item['name']} -> Hedef Bedenler: {', '.join(sizes)}")
-            return item
-        return None
-    except Exception as exc:
-        print(f"  [HATA] Sekme tarama hatası ({product.get('name', 'Ürün')}): {exc}")
-        return None
-    finally:
-        try:
-            if not tab.is_closed():
-                await tab.close()
-        except Exception:
-            pass
+            if sizes:
+                item = dict(product)
+                item["available_sizes"] = sizes
+                print(f"  ✅ {item['name']} -> Hedef Bedenler: {', '.join(sizes)}")
+                return item
+            return None
+        except Exception as exc:
+            print(f"  [HATA] Sekme tarama hatası ({product.get('name', 'Ürün')}): {exc}")
+            return None
+        finally:
+            try:
+                if not tab.is_closed():
+                    await tab.close()
+            except Exception:
+                pass
 
 
-async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> None:
-    """Run Zara wishlist polling loop with simultaneous multi-tab size verification."""
+async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
+    """Run Zara wishlist polling loop with bounded concurrent size verification."""
     favorites_page = await context.new_page()
     if not await ensure_zara_login(context, favorites_page):
         send_telegram_message("🚨 Zara oturumu açılamadı (Ülke/Captcha/Login engeli).")
-        return
+        return False
 
     notifier = StockWaveNotifier("ZARA")
     start_time = time.time()
     max_seconds = max_run_minutes * 60 if max_run_minutes > 0 else float("inf")
     cycle = 0
+    sem = asyncio.Semaphore(4)
 
     while (time.time() - start_time) < max_seconds:
         cycle += 1
         print(f"\n[ZARA — Tur #{cycle}] Favoriler yenileniyor...")
 
         if cycle > 1:
-            try:
-                await favorites_page.reload(wait_until="domcontentloaded", timeout=30000)
-                await favorites_page.wait_for_timeout(3500)
-            except Exception as exc:
-                print(f"[HATA] Sayfa yenilenemedi: {exc}")
+            if not await safe_reload_or_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=30000):
                 await asyncio.sleep(REFRESH_INTERVAL)
                 continue
+            await favorites_page.wait_for_timeout(3500)
 
         await handle_country_and_cookies(favorites_page)
 
@@ -319,30 +410,54 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> None:
             await asyncio.sleep(ERROR_COOLDOWN)
             continue
 
-        current_url = favorites_page.url.lower()
+        current_url = (favorites_page.url or "").lower()
         if "logon" in current_url or "login" in current_url:
             print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
             if not await ensure_zara_login(context, favorites_page):
                 send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
-                return
+                return False
+
+        if "/tr/tr" not in current_url or not any(
+            k in current_url for k in ("wishlist", "lists", "saved")
+        ):
+            print("[UYARI] Zara favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
+            try:
+                await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
+                await favorites_page.wait_for_timeout(3500)
+                await handle_country_and_cookies(favorites_page)
+            except Exception as exc:
+                print(f"[HATA] Zara favorilere dönülemedi: {exc}")
+                await asyncio.sleep(REFRESH_INTERVAL)
+                continue
+            current_url = (favorites_page.url or "").lower()
+            if "logon" in current_url or "login" in current_url:
+                print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
+                if not await ensure_zara_login(context, favorites_page):
+                    send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
+                    return False
 
         await scroll_page_to_bottom(favorites_page)
 
-        candidates = await _extract_stock_and_discounted_items(favorites_page)
+        extracted = await _extract_stock_and_discounted_items(favorites_page)
+        total = extracted.get("total", 0)
+        in_stock = extracted.get("in_stock", 0)
+        candidates = extracted.get("items", [])
         print(
-            f"[Zara] Hem stokta hem indirimde {len(candidates)} ürün bulundu. "
-            "Tüm yan sekmeler eşzamanlı açılıyor..."
+            f"[Zara] Favorilerde toplam {total} ürün tarandı "
+            f"(stokta: {in_stock}, stokta+indirimde: {len(candidates)})."
         )
+        if cycle == 1 and total == 0:
+            print(f"[Zara] İlk tur 0 ürün teşhisi -> {await page_diagnostics(favorites_page)}")
 
         matched_items: list[dict] = []
         if candidates:
             results = await asyncio.gather(
-                *[_open_and_check_tab(context, prod) for prod in candidates]
+                *[_open_and_check_tab(context, prod, sem) for prod in candidates]
             )
             matched_items = [r for r in results if r is not None]
 
         notifier.process_cycle(matched_items)
-        await save_store_session(context, "zara")
+        await save_store_session(context, "zara", mark_valid=True)
 
         remaining = max_seconds - (time.time() - start_time)
         if remaining <= REFRESH_INTERVAL:
@@ -350,3 +465,5 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> None:
 
         print(f"[Zara] Tarama tamamlandı. {REFRESH_INTERVAL} sn bekleniyor...")
         await asyncio.sleep(REFRESH_INTERVAL)
+
+    return True

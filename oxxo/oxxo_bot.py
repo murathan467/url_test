@@ -10,7 +10,14 @@ from config import (
     REFRESH_INTERVAL,
     TARGET_SIZES,
 )
-from core.browser import click_first_visible, human_type, scroll_page_to_bottom
+from core.browser import (
+    click_first_visible,
+    human_type,
+    page_diagnostics,
+    safe_goto,
+    safe_reload_or_goto,
+    scroll_page_to_bottom,
+)
 from core.notifier import StockWaveNotifier, send_telegram_message
 from core.session import save_store_session
 
@@ -24,8 +31,11 @@ async def handle_cookies(page: Page) -> None:
         "button:has-text('Tüm Çerezleri Kabul Et')",
         "a:has-text('TÜM ÇEREZLERİ KABUL ET')",
     ]
-    if await click_first_visible(page, cookie_selectors, timeout_ms=2000, post_wait_ms=1000):
-        print("[Oxxo] Çerezler kabul edildi.")
+    matched_cookie = await click_first_visible(
+        page, cookie_selectors, timeout_ms=2000, post_wait_ms=1000
+    )
+    if matched_cookie:
+        print(f"[Oxxo] Çerezler kabul edildi ({matched_cookie}).")
 
 
 async def has_block_or_captcha(page: Page) -> bool:
@@ -46,14 +56,19 @@ async def has_block_or_captcha(page: Page) -> bool:
 
 async def ensure_oxxo_login(context: BrowserContext, page: Page) -> bool:
     """Verify Oxxo session on FollowList or attempt login when no CAPTCHA blocks it."""
-    await page.goto(OXXO_FAVORITES_URL, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3500)
-    await handle_cookies(page)
+    try:
+        await safe_goto(page, OXXO_FAVORITES_URL, timeout_ms=30000, retries=2)
+        await page.wait_for_timeout(3500)
+        await handle_cookies(page)
+        print(f"[Oxxo] İlk sayfa kontrolü -> {await page_diagnostics(page)}")
 
-    if "login" not in page.url.lower() and not await has_block_or_captcha(page):
-        print("[Oxxo] ✅ Kayıtlı oturum aktif, doğrudan takip listesine girildi.")
-        await save_store_session(context, "oxxo")
-        return True
+        if "login" not in (page.url or "").lower() and not await has_block_or_captcha(page):
+            print("[Oxxo] ✅ Kayıtlı oturum aktif, doğrudan takip listesine girildi.")
+            await save_store_session(context, "oxxo", mark_valid=True)
+            return True
+    except Exception as exc:
+        print(f"[HATA] Oxxo başlangıç oturum kontrolü hatası: {exc}")
+        return False
 
     if not COMMON_EMAIL or not COMMON_PASSWORD:
         print("[HATA] COMMON_EMAIL veya COMMON_PASSWORD eksik.")
@@ -61,7 +76,7 @@ async def ensure_oxxo_login(context: BrowserContext, page: Page) -> bool:
 
     print("[Oxxo] Oturum kapalı, otomatik giriş başlatılıyor...")
     try:
-        await page.goto(OXXO_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+        await safe_goto(page, OXXO_LOGIN_URL, timeout_ms=30000, retries=2)
         await page.wait_for_timeout(3000)
         await handle_cookies(page)
 
@@ -89,20 +104,20 @@ async def ensure_oxxo_login(context: BrowserContext, page: Page) -> bool:
         await page.locator("a#LoginButton, button#LoginButton").first.click()
         await page.wait_for_timeout(5000)
 
-        if "login" in page.url.lower() or await has_block_or_captcha(page):
-            print("[HATA] Oxxo girişi tamamlanamadı.")
+        if "login" in (page.url or "").lower() or await has_block_or_captcha(page):
+            print(f"[HATA] Oxxo girişi tamamlanamadı -> {await page_diagnostics(page)}")
             return False
 
-        await page.goto(OXXO_FAVORITES_URL, wait_until="domcontentloaded", timeout=30000)
+        await safe_goto(page, OXXO_FAVORITES_URL, timeout_ms=30000, retries=2)
         await page.wait_for_timeout(3500)
         await handle_cookies(page)
 
-        if "login" in page.url.lower():
-            print("[HATA] Oxxo FollowList sayfasına erişilemedi.")
+        if "login" in (page.url or "").lower():
+            print(f"[HATA] Oxxo FollowList sayfasına erişilemedi -> {await page_diagnostics(page)}")
             return False
 
         print("[Oxxo] ✅ Otomatik giriş başarılı!")
-        await save_store_session(context, "oxxo")
+        await save_store_session(context, "oxxo", mark_valid=True)
         return True
     except Exception as exc:
         print(f"[HATA] Oxxo login hatası: {exc}")
@@ -162,130 +177,132 @@ async def _extract_oxxo_candidates(page: Page) -> list[dict]:
     )
 
 
-async def _open_and_check_tab(context: BrowserContext, product: dict) -> dict | None:
-    """Open Oxxo product in a new tab concurrently; require BOTH discount and TARGET_SIZES stock."""
+async def _open_and_check_tab(
+    context: BrowserContext, product: dict, sem: asyncio.Semaphore
+) -> dict | None:
+    """Open Oxxo product in a new tab (bounded by sem); require BOTH discount and TARGET_SIZES stock."""
     target_upper = [str(s).upper() for s in TARGET_SIZES]
-    tab = await context.new_page()
-    try:
-        await tab.goto(product["url"], wait_until="domcontentloaded", timeout=30000)
-        await tab.wait_for_timeout(2200)
-
-        info = await tab.evaluate(
-            """
-            (targetSizes) => {
-                const info = { sizes: [], oldPrice: "", newPrice: "", hasDiscount: false, name: "" };
-
-                try {
-                    const titleEl = document.querySelector('h1.ProductHeader, h1');
-                    if (titleEl) info.name = titleEl.innerText.trim();
-
-                    const redPriceEl = document.querySelector('.Prices span.color-red, span.Price.color-red, span.color-red');
-                    const normalPriceEl = document.querySelector('h1.ProductHeader ~ span.Price')
-                        || document.querySelector('.Prices span.Price:not(.color-red)')
-                        || document.querySelector('.Prices span.Price')
-                        || document.querySelector('span.Price');
-
-                    if (redPriceEl && redPriceEl.innerText.includes('TL')) {
-                        info.hasDiscount = true;
-                        info.newPrice = redPriceEl.innerText.trim();
-                        if (normalPriceEl && normalPriceEl !== redPriceEl && normalPriceEl.innerText.includes('TL')) {
-                            info.oldPrice = normalPriceEl.innerText.trim();
-                        }
-                    } else if (normalPriceEl) {
-                        info.newPrice = normalPriceEl.innerText.trim();
-                        if (normalPriceEl.className && normalPriceEl.className.includes('color-red')) {
-                            info.hasDiscount = true;
-                        }
-                    }
-
-                    if (!info.hasDiscount) {
-                        const allPriceSpans = document.querySelectorAll('span');
-                        for (let j = 0; j < allPriceSpans.length; j++) {
-                            const cls = allPriceSpans[j].className;
-                            if (typeof cls === "string" && cls.includes('color-red') && allPriceSpans[j].innerText.includes('TL')) {
-                                info.hasDiscount = true;
-                                info.newPrice = allPriceSpans[j].innerText.trim();
-                                break;
-                            }
-                        }
-                    }
-                } catch (e) {}
-
-                const buttons = document.querySelectorAll('.SizeArea a, .outer a');
-                buttons.forEach(btn => {
-                    const outerText = btn.innerText.trim().toUpperCase();
-                    const isOutOfStock = btn.closest('.outer') !== null
-                        || (btn.getAttribute("data-stock") !== "True" && !btn.closest('.SizeArea'));
-
-                    if (!isOutOfStock) {
-                        const sizeName = outerText.split("\\n")[0].trim();
-                        for (const t of targetSizes) {
-                            if (sizeName === t || new RegExp("\\\\b" + t + "\\\\b", "i").test(sizeName)) {
-                                info.sizes.push(t);
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                info.sizes = [...new Set(info.sizes)];
-                return info;
-            }
-            """,
-            target_upper,
-        )
-
-        if info and info.get("hasDiscount") and info.get("sizes"):
-            item = dict(product)
-            if info.get("name"):
-                item["name"] = info["name"]
-            if info.get("oldPrice"):
-                item["oldPrice"] = info["oldPrice"]
-            if info.get("newPrice"):
-                item["newPrice"] = info["newPrice"]
-            item["hasDiscount"] = True
-            item["available_sizes"] = info["sizes"]
-            print(f"  ✅ {item['name']} -> Hedef Bedenler: {', '.join(item['available_sizes'])}")
-            return item
-        return None
-    except Exception as exc:
-        print(f"  [HATA] Oxxo sekme tarama hatası ({product.get('name', 'Ürün')}): {exc}")
-        return None
-    finally:
+    async with sem:
+        tab = await context.new_page()
         try:
-            if not tab.is_closed():
-                await tab.close()
-        except Exception:
-            pass
+            await safe_goto(tab, product["url"], timeout_ms=30000, retries=2)
+            await tab.wait_for_timeout(2200)
+
+            info = await tab.evaluate(
+                """
+                (targetSizes) => {
+                    const info = { sizes: [], oldPrice: "", newPrice: "", hasDiscount: false, name: "" };
+
+                    try {
+                        const titleEl = document.querySelector('h1.ProductHeader, h1');
+                        if (titleEl) info.name = titleEl.innerText.trim();
+
+                        const redPriceEl = document.querySelector('.Prices span.color-red, span.Price.color-red, span.color-red');
+                        const normalPriceEl = document.querySelector('h1.ProductHeader ~ span.Price')
+                            || document.querySelector('.Prices span.Price:not(.color-red)')
+                            || document.querySelector('.Prices span.Price')
+                            || document.querySelector('span.Price');
+
+                        if (redPriceEl && redPriceEl.innerText.includes('TL')) {
+                            info.hasDiscount = true;
+                            info.newPrice = redPriceEl.innerText.trim();
+                            if (normalPriceEl && normalPriceEl !== redPriceEl && normalPriceEl.innerText.includes('TL')) {
+                                info.oldPrice = normalPriceEl.innerText.trim();
+                            }
+                        } else if (normalPriceEl) {
+                            info.newPrice = normalPriceEl.innerText.trim();
+                            if (normalPriceEl.className && normalPriceEl.className.includes('color-red')) {
+                                info.hasDiscount = true;
+                            }
+                        }
+
+                        if (!info.hasDiscount) {
+                            const allPriceSpans = document.querySelectorAll('span');
+                            for (let j = 0; j < allPriceSpans.length; j++) {
+                                const cls = allPriceSpans[j].className;
+                                if (typeof cls === "string" && cls.includes('color-red') && allPriceSpans[j].innerText.includes('TL')) {
+                                    info.hasDiscount = true;
+                                    info.newPrice = allPriceSpans[j].innerText.trim();
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+
+                    const buttons = document.querySelectorAll('.SizeArea a, .outer a');
+                    buttons.forEach(btn => {
+                        const outerText = btn.innerText.trim().toUpperCase();
+                        const isOutOfStock = btn.closest('.outer') !== null
+                            || (btn.getAttribute("data-stock") !== "True" && !btn.closest('.SizeArea'));
+
+                        if (!isOutOfStock) {
+                            const sizeName = outerText.split("\\n")[0].trim();
+                            for (const t of targetSizes) {
+                                if (sizeName === t || new RegExp("\\\\b" + t + "\\\\b", "i").test(sizeName)) {
+                                    info.sizes.push(t);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    info.sizes = [...new Set(info.sizes)];
+                    return info;
+                }
+                """,
+                target_upper,
+            )
+
+            if info and info.get("hasDiscount") and info.get("sizes"):
+                item = dict(product)
+                if info.get("name"):
+                    item["name"] = info["name"]
+                if info.get("oldPrice"):
+                    item["oldPrice"] = info["oldPrice"]
+                if info.get("newPrice"):
+                    item["newPrice"] = info["newPrice"]
+                item["hasDiscount"] = True
+                item["available_sizes"] = info["sizes"]
+                print(f"  ✅ {item['name']} -> Hedef Bedenler: {', '.join(item['available_sizes'])}")
+                return item
+            return None
+        except Exception as exc:
+            print(f"  [HATA] Oxxo sekme tarama hatası ({product.get('name', 'Ürün')}): {exc}")
+            return None
+        finally:
+            try:
+                if not tab.is_closed():
+                    await tab.close()
+            except Exception:
+                pass
 
 
-async def run_oxxo_loop(context: BrowserContext, max_run_minutes: int) -> None:
-    """Run Oxxo FollowList polling loop with simultaneous multi-tab discount + size checks."""
+async def run_oxxo_loop(context: BrowserContext, max_run_minutes: int) -> bool:
+    """Run Oxxo FollowList polling loop with bounded concurrent discount + size checks."""
     favorites_page = await context.new_page()
     if not await ensure_oxxo_login(context, favorites_page):
         send_telegram_message(
             "🚨 Oxxo oturumu açılamadı (reCAPTCHA/Login engeli). "
             "Lütfen yerelde 'python export_session.py --store oxxo' çalıştırıp OXXO_STORAGE_STATE secret'ını güncelleyin."
         )
-        return
+        return False
 
     notifier = StockWaveNotifier("OXXO")
     start_time = time.time()
     max_seconds = max_run_minutes * 60 if max_run_minutes > 0 else float("inf")
     cycle = 0
+    sem = asyncio.Semaphore(4)
 
     while (time.time() - start_time) < max_seconds:
         cycle += 1
         print(f"\n[OXXO — Tur #{cycle}] Takip listesi yenileniyor...")
 
         if cycle > 1:
-            try:
-                await favorites_page.reload(wait_until="domcontentloaded", timeout=30000)
-                await favorites_page.wait_for_timeout(3500)
-            except Exception as exc:
-                print(f"[HATA] Oxxo sayfası yenilenemedi: {exc}")
+            ok = await safe_reload_or_goto(favorites_page, OXXO_FAVORITES_URL, timeout_ms=30000)
+            if not ok:
                 await asyncio.sleep(REFRESH_INTERVAL)
                 continue
+            await favorites_page.wait_for_timeout(3500)
 
         await handle_cookies(favorites_page)
 
@@ -294,29 +311,29 @@ async def run_oxxo_loop(context: BrowserContext, max_run_minutes: int) -> None:
             await asyncio.sleep(ERROR_COOLDOWN)
             continue
 
-        if "login" in favorites_page.url.lower():
+        if "login" in (favorites_page.url or "").lower():
             print("[UYARI] Oxxo oturumu düştü, yeniden giriş deneniyor...")
             if not await ensure_oxxo_login(context, favorites_page):
                 send_telegram_message("🚨 Oxxo oturumu düştü ve yenilenemedi.")
-                return
+                return False
 
         await scroll_page_to_bottom(favorites_page)
 
         candidates = await _extract_oxxo_candidates(favorites_page)
         print(
             f"[Oxxo] {len(candidates)} aday ürün bulundu. "
-            "Stok+indirim kontrolü için tüm yan sekmeler eşzamanlı açılıyor..."
+            "Stok+indirim kontrolü için yan sekmeler (en fazla 4 eşzamanlı) açılıyor..."
         )
 
         matched_items: list[dict] = []
         if candidates:
             results = await asyncio.gather(
-                *[_open_and_check_tab(context, prod) for prod in candidates]
+                *[_open_and_check_tab(context, prod, sem) for prod in candidates]
             )
             matched_items = [r for r in results if r is not None]
 
         notifier.process_cycle(matched_items)
-        await save_store_session(context, "oxxo")
+        await save_store_session(context, "oxxo", mark_valid=True)
 
         remaining = max_seconds - (time.time() - start_time)
         if remaining <= REFRESH_INTERVAL:
@@ -324,3 +341,5 @@ async def run_oxxo_loop(context: BrowserContext, max_run_minutes: int) -> None:
 
         print(f"[Oxxo] Tarama tamamlandı. {REFRESH_INTERVAL} sn bekleniyor...")
         await asyncio.sleep(REFRESH_INTERVAL)
+
+    return True

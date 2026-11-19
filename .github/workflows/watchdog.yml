@@ -1,0 +1,50 @@
+name: 7/24 Watchdog (Otomatik Kurtarma)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17,47 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ensure-running:
+    name: Bot Durum Kontrolu
+    if: vars.BOT_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: tracker.yml aktif mi kontrol et ve gerekirse baslat
+        uses: actions/github-script@v9
+        with:
+          retries: '3'
+          script: |
+            const activeStatuses = new Set(["in_progress", "queued", "waiting", "requested", "pending"]);
+            const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "tracker.yml",
+              per_page: 15,
+            });
+
+            const activeRun = runsData.workflow_runs.find((r) => activeStatuses.has(r.status));
+            if (activeRun) {
+              console.log(
+                `tracker.yml zaten aktif (run_id=${activeRun.id}, status=${activeRun.status}). Ek baslatma yapilmadi.`
+              );
+              return;
+            }
+
+            console.log("Aktif tracker.yml kosusu bulunamadi; 7/24 kurtarma tetiklemesi gonderiliyor...");
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "tracker.yml",
+              ref: "main",
+              inputs: {
+                chain_depth: "1",
+              },
+            });
+            console.log("tracker.yml basariyla tetiklendi.");

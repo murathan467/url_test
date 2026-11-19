@@ -2,8 +2,25 @@ name: Zara, Mango & Oxxo Takip Botu
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
+    inputs:
+      chain_depth:
+        description: '7/24 zincir tur sayaci'
+        required: false
+        default: '1'
+        type: string
+      reset_cache:
+        description: 'Kayitli oturum onbellegini yoksay ve Secret/giris ile yeniden basla'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: store-tracker-24-7
+  cancel-in-progress: false
 
 jobs:
   track-store:
@@ -22,27 +39,50 @@ jobs:
             store_upper: OXXO
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Baslangic zamanini kaydet
+        id: timing
+        run: echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
 
       - name: Xvfb ve Patchright kur
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb
+          fi
           pip install -r requirements.txt
           patchright install chromium
-          patchright install-deps chromium
+          CHROME_BIN="$(find "$HOME/.cache/ms-playwright" -name 'chrome' -type f 2>/dev/null | head -n 1 || true)"
+          if [ -n "$CHROME_BIN" ] && ldd "$CHROME_BIN" | grep -q "not found"; then
+            echo "Eksik Chromium sistem kutuphanesi algilandi, install-deps calistiriliyor..."
+            patchright install-deps chromium
+          else
+            echo "Tum Chromium sistem kutuphaneleri hazir, install-deps atlandi."
+          fi
+
+      - name: Secret parmak izini hesapla
+        id: secret_meta
+        env:
+          STORE_STATE: ${{ secrets[format('{0}_STORAGE_STATE', matrix.store_upper)] }}
+        run: |
+          HASH="$(printf '%s' "$STORE_STATE" | sha256sum | cut -c1-12)"
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Sifreli oturum onbellegini geri yukle
-        uses: actions/cache/restore@v4
+        if: ${{ inputs.reset_cache != true }}
+        uses: actions/cache/restore@v6
         with:
           path: .session_cache/${{ matrix.store }}.enc
-          key: session-${{ matrix.store }}-${{ github.run_id }}
+          key: session-v2-${{ matrix.store }}-${{ steps.secret_meta.outputs.hash }}-${{ github.run_id }}
           restore-keys: |
-            session-${{ matrix.store }}-
+            session-v2-${{ matrix.store }}-${{ steps.secret_meta.outputs.hash }}-
 
       - name: Oturum dosyasini hazirla
         env:
@@ -94,13 +134,37 @@ jobs:
           EOF
           fi
 
+      - name: Guvenli calisma suresini hesapla
+        id: budget
+        env:
+          CONFIGURED_MAX: ${{ vars.MAX_RUN_MINUTES || '335' }}
+          START_EPOCH: ${{ steps.timing.outputs.start_epoch }}
+        run: |
+          NOW_EPOCH="$(date +%s)"
+          ELAPSED_MIN=$(( (NOW_EPOCH - START_EPOCH) / 60 ))
+          SAFE_CAP=$(( 340 - ELAPSED_MIN ))
+          if [ "$SAFE_CAP" -lt 5 ]; then
+            SAFE_CAP=5
+          fi
+          CFG="$(echo "$CONFIGURED_MAX" | tr -cd '0-9')"
+          if [ -z "$CFG" ] || [ "$CFG" -lt 5 ]; then
+            CFG=335
+          fi
+          if [ "$CFG" -le "$SAFE_CAP" ]; then
+            EFFECTIVE="$CFG"
+          else
+            EFFECTIVE="$SAFE_CAP"
+          fi
+          echo "Kurulum suresi: ${ELAPSED_MIN} dk | Guvenli tavan: ${SAFE_CAP} dk | Bot suresi: ${EFFECTIVE} dk"
+          echo "effective_max_minutes=${EFFECTIVE}" >> "$GITHUB_OUTPUT"
+
       - name: Botu sanal ekranda calistir
         env:
           COMMON_EMAIL: ${{ secrets.COMMON_EMAIL }}
           COMMON_PASSWORD: ${{ secrets.COMMON_PASSWORD }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_RUN_MINUTES: ${{ vars.MAX_RUN_MINUTES || '345' }}
+          MAX_RUN_MINUTES: ${{ steps.budget.outputs.effective_max_minutes }}
           REFRESH_INTERVAL: ${{ vars.REFRESH_INTERVAL || '30' }}
           MAX_ALERTS_PER_WAVE: ${{ vars.MAX_ALERTS_PER_WAVE || '3' }}
           TARGET_SIZES: ${{ vars.TARGET_SIZES || 'S,XS,34,36' }}
@@ -115,16 +179,82 @@ jobs:
           COMMON_PASSWORD: ${{ secrets.COMMON_PASSWORD }}
         run: |
           mkdir -p .session_cache
-          if [ -s "${{ matrix.store }}_storage_state.json" ] && [ -n "$COMMON_PASSWORD" ]; then
+          if [ -f ".session_cache/${{ matrix.store }}.valid" ] && [ -s "${{ matrix.store }}_storage_state.json" ] && [ -n "$COMMON_PASSWORD" ]; then
             openssl enc -aes-256-cbc -pbkdf2 -pass env:COMMON_PASSWORD \
               -in "${{ matrix.store }}_storage_state.json" \
               -out ".session_cache/${{ matrix.store }}.enc"
             echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Oturum dogrulanmadigi icin onbellek guncellenmedi."
           fi
 
       - name: Sifreli oturumu onbellege kaydet
         if: always() && steps.encrypt.outputs.has_cache == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .session_cache/${{ matrix.store }}.enc
-          key: session-${{ matrix.store }}-${{ github.run_id }}
+          key: session-v2-${{ matrix.store }}-${{ steps.secret_meta.outputs.hash }}-${{ github.run_id }}
+
+  retrigger:
+    name: Sonraki 7/24 Turu Baslat
+    needs: [track-store]
+    if: always() && !cancelled() && needs.track-store.result != 'cancelled' && vars.BOT_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Zincirleme sonraki kosuyu tetikle
+        uses: actions/github-script@v9
+        with:
+          retries: '3'
+          script: |
+            const { data: currentRun } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            const startedMs = new Date(currentRun.run_started_at || currentRun.created_at).getTime();
+            const elapsedSec = Math.max(0, Math.round((Date.now() - startedMs) / 1000));
+            const trackResult = "${{ needs.track-store.result }}";
+
+            if (trackResult !== "success" && elapsedSec < 600) {
+              console.log(
+                `Uyari: track-store sonucu '${trackResult}' ve sure yalnizca ${elapsedSec} sn. ` +
+                "Kisa dongu olusmamasi icin anlik yeniden tetikleme atlandi; watchdog.yml devreye girecek."
+              );
+              return;
+            }
+
+            const activeStatuses = new Set(["in_progress", "queued", "waiting", "requested", "pending"]);
+            const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "tracker.yml",
+              per_page: 15,
+            });
+
+            const existing = runsData.workflow_runs.find(
+              (r) => r.id !== context.runId && activeStatuses.has(r.status)
+            );
+            if (existing) {
+              console.log(
+                `Zaten aktif/sirada bir tracker.yml kosusu var (id=${existing.id}, status=${existing.status}); yeni tetikleme atlandi.`
+              );
+              return;
+            }
+
+            const currentDepth = parseInt("${{ inputs.chain_depth || '1' }}", 10) || 1;
+            const nextDepth = String(currentDepth + 1);
+            console.log(`7/24 zincir devam ediyor: sonraki tur #${nextDepth} tetikleniyor...`);
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "tracker.yml",
+              ref: "${{ github.ref_name }}",
+              inputs: {
+                chain_depth: nextDepth,
+              },
+            });
