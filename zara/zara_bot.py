@@ -265,6 +265,17 @@ async def _zara_dom_diagnostics(page: Page) -> str:
         return f"dom_diag_err={exc}"
 
 
+def _has_zara_api_auth_failure(net_logs: list[str]) -> bool:
+    """Return True when wishlist or OAuth refresh API endpoints return 400/401/403."""
+    for entry in net_logs:
+        lower_entry = entry.lower()
+        if "/user/wishlists" in lower_entry and entry.startswith(("401 ", "403 ")):
+            return True
+        if "/user/oauth2/refresh" in lower_entry and entry.startswith(("400 ", "401 ", "403 ")):
+            return True
+    return False
+
+
 async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
     """Verify Zara session on wishlist or perform login via home -> logon."""
     net_logs, stop_net_logger = _attach_zara_network_logger(page)
@@ -297,7 +308,14 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             print(f"[Zara] DOM teşhis -> {await _zara_dom_diagnostics(page)}")
             print(f"[Zara] Ağ teşhis ({len(net_logs)} yanıt) -> {net_logs}")
 
-        if await _is_zara_session_active(page, state):
+        api_auth_failed = _has_zara_api_auth_failure(net_logs)
+        if api_auth_failed:
+            print(
+                "[UYARI] Zara wishlist/OAuth API reddedildi (400/401/403); "
+                "kayıtlı oturum geçersiz sayılıyor."
+            )
+
+        if not api_auth_failed and await _is_zara_session_active(page, state):
             print("[Zara] ✅ Kayıtlı oturum aktif, doğrudan favorilere girildi.")
             await save_store_session(context, "zara", mark_valid=True)
             return True
@@ -531,7 +549,10 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
     """Run Zara wishlist polling loop with bounded concurrent size verification."""
     favorites_page = await context.new_page()
     if not await ensure_zara_login(context, favorites_page):
-        send_telegram_message("🚨 Zara oturumu açılamadı (Ülke/Captcha/Login engeli).")
+        send_telegram_message(
+            "🚨 Zara oturumu açılamadı (OAuth süresi dolmuş veya WAF/Captcha engeli). "
+            "Yerelde 'python export_session.py --store zara' ile ZARA_STORAGE_STATE secret'ını yenileyin."
+        )
         return False
 
     notifier = StockWaveNotifier("ZARA")
