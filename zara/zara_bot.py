@@ -22,7 +22,7 @@ from core.browser import (
     scroll_page_to_bottom,
 )
 from core.notifier import StockWaveNotifier, send_telegram_message
-from core.session import save_store_session
+from core.session import clear_session_valid_marker, save_store_session
 
 
 async def handle_country_and_cookies(page: Page) -> None:
@@ -160,20 +160,25 @@ def _attach_zara_network_logger(page: Page) -> tuple[list[str], Callable[[], Non
     logs: list[str] = []
     state = {"active": True}
     static_exts = (".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".woff", ".woff2", ".ico", ".map")
-    interesting = ("wishlist", "itxrest", "/lists", "saved", "favorite")
+    interesting = ("wishlist", "itxrest", "/lists", "saved", "favorite", "/user/", "/api/")
 
     async def _on_response(resp: Response) -> None:
-        if not state["active"] or len(logs) >= 25:
+        if not state["active"] or len(logs) >= 35:
             return
         try:
             path = resp.url.split("?")[0]
             lower_path = path.lower()
             if lower_path.endswith(static_exts):
                 return
-            if not any(tok in lower_path for tok in interesting):
+            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            is_interesting = (
+                "json" in ct
+                or resp.status >= 400
+                or any(tok in lower_path for tok in interesting)
+            )
+            if not is_interesting:
                 return
 
-            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
             size_hdr = resp.headers.get("content-length") or "?"
             if "json" in ct and resp.status < 400:
                 try:
@@ -601,6 +606,23 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
                 print(f"[Zara] Tur #{cycle} Ağ teşhis ({len(loop_net_logs)} yanıt) -> {loop_net_logs}")
             if cycle >= 2:
                 stop_loop_net_logger()
+
+            if total == 0:
+                loop_state = await _inspect_zara_page(favorites_page)
+                if (
+                    loop_state["has_login_url"]
+                    or loop_state["has_login_form"]
+                    or loop_state["has_login_cta_in_main"]
+                ):
+                    print(
+                        "[UYARI] Zara oturumu sayfa içinde düştü "
+                        "(login_cta/form algılandı), yeniden giriş deneniyor..."
+                    )
+                    clear_session_valid_marker("zara")
+                    if not await ensure_zara_login(context, favorites_page):
+                        send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
+                        return False
+                    continue
 
             matched_items: list[dict] = []
             if candidates:

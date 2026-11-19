@@ -19,7 +19,7 @@ from core.browser import (
     scroll_page_to_bottom,
 )
 from core.notifier import StockWaveNotifier, send_telegram_message
-from core.session import save_store_session
+from core.session import clear_session_valid_marker, save_store_session
 
 
 async def handle_country_and_cookies(page: Page) -> None:
@@ -444,6 +444,23 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
         print(f"[Mango] Favorilerde toplam {total} ürün görüldü ({len(candidates)} stokta aday).")
         if cycle == 1 and total == 0:
             print(f"[Mango] İlk tur 0 ürün teşhisi -> {await page_diagnostics(favorites_page)}")
+
+        if total == 0:
+            loop_state = await _inspect_mango_page(favorites_page)
+            if (
+                loop_state["has_login_url"]
+                or loop_state["has_login_form"]
+                or loop_state["has_login_cta_in_main"]
+            ):
+                print(
+                    "[UYARI] Mango oturumu sayfa içinde düştü "
+                    "(login_cta/form algılandı), yeniden giriş deneniyor..."
+                )
+                clear_session_valid_marker("mango")
+                if not await ensure_mango_login(context, favorites_page):
+                    send_telegram_message("🚨 Mango oturumu düştü ve yenilenemedi.")
+                    return False
+                continue
 
         matched_items: list[dict] = []
         if candidates:

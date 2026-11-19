@@ -194,7 +194,7 @@ jobs:
 
       - name: Guncel oturumu sifrele
         id: encrypt
-        if: ${{ always() && (inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store) }}
+        if: ${{ !cancelled() && (inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store) }}
         env:
           COMMON_PASSWORD: ${{ secrets.COMMON_PASSWORD }}
         run: |
@@ -209,7 +209,7 @@ jobs:
           fi
 
       - name: Sifreli oturumu onbellege kaydet
-        if: ${{ always() && steps.encrypt.outputs.has_cache == 'true' && (inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store) }}
+        if: ${{ !cancelled() && steps.encrypt.outputs.has_cache == 'true' && (inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store) }}
         uses: actions/cache/save@v6
         with:
           path: .session_cache/${{ matrix.store }}.enc
