@@ -70,6 +70,12 @@ async def handle_country_and_cookies(page: Page) -> None:
 async def has_block_or_captcha(page: Page) -> bool:
     """Detect WAF blocks or CAPTCHA overlays without attempting to bypass them."""
     try:
+        title = (await page.title() or "").lower()
+        if "access denied" in title:
+            return True
+    except Exception:
+        pass
+    try:
         text = (await page.locator("body").inner_text(timeout=2500)).lower()
         if any(k in text for k in ["bir sorun oluştu", "access denied"]):
             return True
@@ -88,7 +94,7 @@ async def _inspect_zara_page(page: Page) -> dict:
     has_login_form = False
     try:
         has_login_form = await page.locator(
-            "input[name='email'], input[name='logonId'], input[name='password'], "
+            "input[name='email'], input[name='username'], input[name='logonId'], input[name='password'], "
             "input[type='email'], input[type='password']"
         ).first.is_visible(timeout=500)
     except Exception:
@@ -335,7 +341,9 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
         await page.wait_for_timeout(3000)
         await handle_country_and_cookies(page)
 
-        login_link = page.locator("a[href*='logon'], a:has-text('GİRİŞ YAP')").first
+        login_link = page.locator(
+            "[data-qa-id='layout-desktop-layout-logon-action'], a[href*='logon'], a:has-text('GİRİŞ YAP')"
+        ).first
         try:
             if await login_link.is_visible(timeout=4000):
                 await login_link.click()
@@ -348,20 +356,22 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
         await handle_country_and_cookies(page)
 
         if await has_block_or_captcha(page):
-            print("[HATA] Zara giriş sayfasında Captcha/WAF engeli çıktı.")
+            print("[HATA] Zara giriş sayfasında Captcha/WAF/Inditex HLP engeli çıktı.")
             return False
 
         email_input = page.locator(
-            "input[name='email'], input[name='logonId'], input[type='email'], input[aria-label*='E-posta']"
+            "input[name='username'], input[type='email'], input[name='email'], input[name='logonId'], input[aria-label*='E-posta']"
         ).first
         await email_input.wait_for(state="visible", timeout=15000)
         await human_type(email_input, COMMON_EMAIL)
         await page.wait_for_timeout(800)
 
-        await page.locator(
+        submit_email_btn = page.locator(
+            "button:has-text('DEVAM ET'), button:has-text('Devam et'), button:has-text('CONTINUE'), "
             "button[data-qa-action='submit'], button.submit-button, button[type='submit']"
-        ).first.click()
-        await page.wait_for_timeout(5000)
+        ).first
+        await submit_email_btn.click()
+        await page.wait_for_timeout(4500)
         await handle_country_and_cookies(page)
 
         if await has_block_or_captcha(page):
@@ -370,33 +380,36 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
 
         pwd_link = page.get_by_text("Şifre ile giriş yap").or_(
             page.get_by_text("Log in with password")
-        ).first
+        ).or_(page.get_by_text("Parola ile giriş yap")).first
         try:
-            if await pwd_link.is_visible(timeout=3000):
+            if await pwd_link.is_visible(timeout=2500):
                 await pwd_link.click()
                 await page.wait_for_timeout(1500)
         except Exception:
             pass
 
         pass_input = page.locator(
-            "input[name='password'], input[type='password'], input[aria-label*='Parola']"
+            "input[name='password'], input[type='password'], input[aria-label*='Parola'], input[aria-label*='Password']"
         ).first
         await pass_input.wait_for(state="visible", timeout=15000)
         await human_type(pass_input, COMMON_PASSWORD)
         await page.wait_for_timeout(800)
 
-        await page.locator(
+        submit_login_btn = page.locator(
+            "button:has-text('OTURUM AÇ'), button:has-text('Oturum aç'), button:has-text('GİRİŞ YAP'), "
+            "button:has-text('LOG IN'), button:has-text('DEVAM ET'), "
             "button[data-qa-action='submit'], button.submit-button, button[type='submit']"
-        ).first.click()
+        ).first
+        await submit_login_btn.click()
         await page.wait_for_timeout(6000)
 
         await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
-        await page.wait_for_timeout(3500)
+        await page.wait_for_timeout(4000)
         await handle_country_and_cookies(page)
 
         if "/tr/tr" not in (page.url or "").lower():
             await safe_goto(page, ZARA_FAVORITES_URL, timeout_ms=30000, retries=2)
-            await page.wait_for_timeout(3500)
+            await page.wait_for_timeout(4000)
             await handle_country_and_cookies(page)
 
         post_state = await _inspect_zara_page(page)

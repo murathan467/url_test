@@ -2,9 +2,12 @@ import argparse
 import base64
 import os
 from config import (
+    MANGO_FAVORITES_URL,
     MANGO_LOGIN_URL,
+    OXXO_FAVORITES_URL,
     OXXO_LOGIN_URL,
     SCRIPT_DIR,
+    ZARA_FAVORITES_URL,
     ZARA_LOGIN_URL,
     get_storage_state_path,
 )
@@ -13,6 +16,12 @@ STORE_URLS = {
     "zara": ZARA_LOGIN_URL,
     "mango": MANGO_LOGIN_URL,
     "oxxo": OXXO_LOGIN_URL,
+}
+
+STORE_FAVORITES = {
+    "zara": ZARA_FAVORITES_URL,
+    "mango": MANGO_FAVORITES_URL,
+    "oxxo": OXXO_FAVORITES_URL,
 }
 
 
@@ -32,10 +41,14 @@ def export_session(store: str) -> None:
     print("Giriş tamamlanıp favoriler/hesap açıldığında bu terminale dönüp ENTER'a basın.")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=["--window-size=1920,1080", "--start-maximized", "--no-sandbox"],
-        )
+        launch_kwargs: dict = {
+            "headless": False,
+            "args": ["--window-size=1920,1080", "--start-maximized", "--no-sandbox"],
+        }
+        if os.name == "nt":
+            launch_kwargs["channel"] = "chrome"
+
+        browser = p.chromium.launch(**launch_kwargs)
         context_kwargs: dict = {
             "viewport": {"width": 1920, "height": 1080},
             "locale": "tr-TR",
@@ -49,6 +62,15 @@ def export_session(store: str) -> None:
         try:
             page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
             input("\n[BEKLENİYOR] Giriş tamamlandıysa ENTER tuşuna basın...")
+            fav_url = STORE_FAVORITES.get(store)
+            if fav_url:
+                print(f"\nFavoriler sayfasına gidilerek oturum ve çerezler tazeleniyor: {fav_url}")
+                try:
+                    page.goto(fav_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3500)
+                except Exception as e:
+                    print(f"Uyarı: Favoriler açılırken hata: {e}")
+
             context.storage_state(path=state_path)
 
             with open(state_path, "rb") as f:

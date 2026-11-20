@@ -196,7 +196,7 @@ async def ensure_mango_login(context: BrowserContext, page: Page) -> bool:
         await page.wait_for_timeout(800)
 
         await page.locator(
-            "button[id='login-form-submit-button'], button[type='submit']"
+            "button[id='login-form-submit-button'], button:has-text('OTURUM AÇ'), button:has-text('Oturum aç'), button[type='submit']"
         ).first.click()
         await page.wait_for_timeout(6000)
 

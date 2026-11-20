@@ -36,15 +36,19 @@ async def launch_store_browser(
     playwright: Playwright, store_name: str
 ) -> tuple[Browser, BrowserContext]:
     """Launch headed Chromium (for Xvfb) with tr-TR locale and resource blocking."""
-    browser = await playwright.chromium.launch(
-        headless=False,
-        args=[
+    launch_kwargs: dict = {
+        "headless": False,
+        "args": [
             "--window-size=1920,1080",
             "--start-maximized",
             "--no-sandbox",
             "--disable-dev-shm-usage",
         ],
-    )
+    }
+    if os.name == "nt":
+        launch_kwargs["channel"] = "chrome"
+
+    browser = await playwright.chromium.launch(**launch_kwargs)
 
     state_path = get_storage_state_path(store_name)
     context_kwargs: dict = {
