@@ -18,6 +18,9 @@ jobs:
     steps:
       - name: tracker.yml aktif mi kontrol et ve gerekirse baslat
         uses: actions/github-script@v9
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         with:
           retries: '3'
           script: |
@@ -34,6 +37,58 @@ jobs:
               console.log(
                 `tracker.yml zaten aktif (run_id=${activeRun.id}, status=${activeRun.status}). Ek baslatma yapilmadi.`
               );
+              return;
+            }
+
+            // --- Ardisik fail koruması ---
+            const completedRuns = runsData.workflow_runs
+              .filter((r) => r.status === "completed")
+              .slice(0, 3);
+
+            const allFailed = completedRuns.length >= 3 &&
+              completedRuns.every((r) => r.conclusion === "failure");
+
+            if (allFailed) {
+              console.log(
+                "Son 3 tracker.yml calismasi ust uste basarisiz. " +
+                "Sonsuz fail dongusu onleniyor; yeni tetikleme ATLANDI."
+              );
+
+              // Telegram uyarisi gonder (tek seferlik)
+              const token = process.env.TELEGRAM_TOKEN || "";
+              const chatId = process.env.TELEGRAM_CHAT_ID || "";
+              if (token && chatId) {
+                const lastFailTime = completedRuns[0]
+                  ? completedRuns[0].updated_at
+                  : "?";
+                const msg =
+                  "⚠️ <b>GizIndirimBot Watchdog Uyarisi</b>\n\n" +
+                  "Son 3 tracker.yml calismasi ust uste <b>basarisiz</b> oldu.\n" +
+                  `Son fail: ${lastFailTime}\n\n` +
+                  "Olasi nedenler:\n" +
+                  "• Ev PC kapali veya proxy erisilemez\n" +
+                  "• Oturum cookie'leri suresi dolmus\n" +
+                  "• WAF/Captcha engeli\n\n" +
+                  "Bot otomatik yeniden baslatilmayacak. " +
+                  "Sorunu giderdikten sonra tracker.yml'i manuel calistirin.";
+                try {
+                  await fetch(
+                    `https://api.telegram.org/bot${token}/sendMessage`,
+                    {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        chat_id: chatId,
+                        text: msg,
+                        parse_mode: "HTML",
+                      }),
+                    }
+                  );
+                  console.log("Telegram uyari mesaji gonderildi.");
+                } catch (e) {
+                  console.log(`Telegram gonderim hatasi: ${e}`);
+                }
+              }
               return;
             }
 

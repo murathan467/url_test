@@ -2,8 +2,23 @@ import asyncio
 import json
 import os
 import random
+from urllib.parse import urlparse
 from patchright.async_api import Browser, BrowserContext, Locator, Page, Playwright, Route
 from config import get_storage_state_path
+
+
+def get_proxy_config() -> dict | None:
+    """Parse HOME_PROXY_URL env var into a Playwright proxy dict, or None if unset."""
+    raw = os.getenv("HOME_PROXY_URL", "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    config: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        config["username"] = parsed.username
+    if parsed.password:
+        config["password"] = parsed.password
+    return config
 
 
 async def _block_heavy_resources(route: Route) -> None:
@@ -56,6 +71,15 @@ async def launch_store_browser(
         "locale": "tr-TR",
         "timezone_id": "Europe/Istanbul",
     }
+
+    # Ev proxy'si varsa tarayıcı bağlamına enjekte et (Zara/Mango için)
+    proxy_cfg = get_proxy_config()
+    if proxy_cfg:
+        context_kwargs["proxy"] = proxy_cfg
+        print(
+            f"[{store_name.upper()}] Ev proxy'si aktif: "
+            f"{proxy_cfg['server']} (kullanıcı: {proxy_cfg.get('username', '-')})"
+        )
 
     valid_state = _load_valid_storage_state(state_path)
     if valid_state:

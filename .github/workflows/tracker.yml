@@ -150,6 +150,25 @@ jobs:
           EOF
           fi
 
+      - name: Tailscale ile ev proxy'sine baglan
+        if: ${{ matrix.store != 'oxxo' && (inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store) }}
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-actions
+
+      - name: Ev proxy erisimini dogrula
+        if: ${{ matrix.store != 'oxxo' && (inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store) }}
+        env:
+          HOME_PROXY_URL: ${{ secrets.HOME_PROXY_URL }}
+        run: |
+          EXIT_IP=$(curl -fsS --max-time 12 -x "$HOME_PROXY_URL" https://api.ipify.org) || {
+            echo "::error::Ev PC proxy erisilemedi (PC kapali veya internet yok). Azure IP ile devam edilmeyecek."
+            exit 78
+          }
+          echo "✅ Ev proxy aktif. Cikis IP: $EXIT_IP"
+
       - name: Guvenli calisma suresini hesapla
         id: budget
         if: ${{ inputs.stores == '' || inputs.stores == 'all' || inputs.stores == matrix.store }}
@@ -189,6 +208,7 @@ jobs:
           MAX_ALERTS_PER_WAVE: ${{ vars.MAX_ALERTS_PER_WAVE || '3' }}
           TARGET_SIZES: ${{ vars.TARGET_SIZES || 'S,XS,34,36' }}
           PYTHONUNBUFFERED: "1"
+          HOME_PROXY_URL: ${{ matrix.store != 'oxxo' && secrets.HOME_PROXY_URL || '' }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python main_bot.py --store "${{ matrix.store }}"
 
