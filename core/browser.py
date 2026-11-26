@@ -3,11 +3,38 @@ import json
 import os
 import random
 from urllib.parse import unquote, urlparse
-from patchright.async_api import Browser, BrowserContext, Locator, Page, Playwright, Route
+from patchright.async_api import Browser, BrowserContext, Locator, Page, Playwright
 from config import get_storage_state_path
 
 
 _ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4"}
+_ACTIVE_PLAYWRIGHT_BY_STORE: dict[str, Playwright] = {}
+_OWNED_PLAYWRIGHT_BY_STORE: dict[str, Playwright] = {}
+
+
+def compute_cycle_sleep(
+    cycle_elapsed: float, refresh_interval: float, min_gap: float = 3.0
+) -> float:
+    """Return sleep duration targeting refresh_interval cadence with a bounded safety floor."""
+    interval = max(1.0, float(refresh_interval))
+    floor = min(float(min_gap), interval)
+    return max(floor, interval - max(0.0, float(cycle_elapsed)))
+
+
+def is_target_closed_error(exc: BaseException) -> bool:
+    """Return True when an exception indicates a dead/closed Chromium page, context, or browser."""
+    msg = str(exc).lower()
+    return any(
+        tok in msg
+        for tok in (
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "context or browser has been closed",
+            "target closed",
+            "connection closed",
+            "epipe",
+        )
+    )
 
 
 def get_proxy_config() -> dict | None:
@@ -58,18 +85,6 @@ def _mask_proxy_server(server: str) -> str:
     return f"{scheme}://{masked_host}{port_part}"
 
 
-async def _block_heavy_resources(route: Route) -> None:
-    """Block images, media, and fonts so many concurrent tabs stay lightweight."""
-    try:
-        if route.request.resource_type in {"image", "media", "font"}:
-            await route.abort()
-        else:
-            await route.continue_()
-    except Exception:
-        # Ignore benign errors when a tab closes mid-request.
-        pass
-
-
 def _load_valid_storage_state(state_path: str) -> str | None:
     """Return state_path if it exists and contains valid Playwright storage JSON."""
     if not os.path.exists(state_path) or os.path.getsize(state_path) == 0:
@@ -104,6 +119,7 @@ async def launch_store_browser(
     if os.name == "nt":
         launch_kwargs["channel"] = "chrome"
 
+    _ACTIVE_PLAYWRIGHT_BY_STORE[store_name.lower()] = playwright
     browser = await playwright.chromium.launch(**launch_kwargs)
 
     state_path = get_storage_state_path(store_name)
@@ -130,6 +146,66 @@ async def launch_store_browser(
 
     context = await browser.new_context(**context_kwargs)
     return browser, context
+
+
+async def close_browser_safely(
+    context: BrowserContext | None = None,
+    browser: Browser | None = None,
+    timeout_sec: float = 8.0,
+) -> None:
+    """Close a Playwright context and browser with strict timeouts so hung sockets never deadlock."""
+    resolved_browser = browser
+    if resolved_browser is None and context is not None:
+        try:
+            resolved_browser = getattr(context, "browser", None)
+        except Exception:
+            resolved_browser = None
+
+    if context is not None:
+        try:
+            await asyncio.wait_for(context.close(), timeout=timeout_sec)
+        except Exception:
+            pass
+
+    if resolved_browser is not None:
+        try:
+            await asyncio.wait_for(resolved_browser.close(), timeout=timeout_sec)
+        except Exception:
+            pass
+
+
+async def cleanup_owned_playwright(store_name: str, timeout_sec: float = 8.0) -> None:
+    """Stop any fallback Playwright driver spawned during live browser recovery."""
+    key = store_name.lower()
+    owned = _OWNED_PLAYWRIGHT_BY_STORE.pop(key, None)
+    if owned is not None:
+        try:
+            await asyncio.wait_for(owned.stop(), timeout=timeout_sec)
+        except Exception:
+            pass
+
+
+async def relaunch_store_browser(
+    store_name: str,
+    old_context: BrowserContext | None = None,
+    old_browser: Browser | None = None,
+    playwright: Playwright | None = None,
+) -> tuple[Browser, BrowserContext]:
+    """Tear down a hung/closed browser+context and launch a fresh one with saved storage_state."""
+    key = store_name.lower()
+    await close_browser_safely(context=old_context, browser=old_browser)
+
+    pw = playwright or _ACTIVE_PLAYWRIGHT_BY_STORE.get(key)
+    if pw is None:
+        from patchright.async_api import async_playwright
+
+        await cleanup_owned_playwright(key)
+        pw = await async_playwright().start()
+        _OWNED_PLAYWRIGHT_BY_STORE[key] = pw
+        _ACTIVE_PLAYWRIGHT_BY_STORE[key] = pw
+
+    print(f"[{store_name.upper()}] Tarayıcı ve bağlam kayıtlı oturumla canlı yeniden başlatılıyor...")
+    return await launch_store_browser(pw, store_name)
 
 
 async def click_first_visible(

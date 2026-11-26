@@ -3,10 +3,15 @@ services:
     image: gogost/gost:latest
     container_name: giz-home-proxy
     restart: unless-stopped
-    command: >-
-      -L "http://${HOME_PROXY_USER:-gizproxy}:${HOME_PROXY_PASS}@:8888?resolver=udp://1.1.1.1:53?only=ipv4,tcp://8.8.8.8:53?only=ipv4"
+    command:
+      - -C
+      - '{"services":[{"name":"home-proxy","addr":":8888","resolver":"ipv4-only","handler":{"type":"http","auth":{"username":"${HOME_PROXY_USER:-gizproxy}","password":"${HOME_PROXY_PASS}"},"metadata":{"keepalive":true,"readTimeout":"60s"}},"listener":{"type":"tcp","metadata":{"keepalive":true,"ttl":"30s"}}}],"resolvers":[{"name":"ipv4-only","nameservers":[{"addr":"udp://1.1.1.1:53","only":"ipv4"},{"addr":"tcp://8.8.8.8:53","only":"ipv4"}]}]}'
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+      - net.ipv4.tcp_keepalive_time=60
+      - net.ipv4.tcp_keepalive_intvl=15
+      - net.ipv4.tcp_keepalive_probes=4
     ports:
       - "127.0.0.1:18888:8888"
     mem_limit: 256m

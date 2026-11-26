@@ -1,6 +1,7 @@
 import argparse
 import base64
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -14,6 +15,8 @@ from config import (
     ZARA_LOGIN_URL,
     get_storage_state_path,
 )
+
+GITHUB_API_VERSION = "2022-11-28"
 
 STORE_URLS = {
     "zara": ZARA_LOGIN_URL,
@@ -91,6 +94,160 @@ def _verify_favorites_page(
     return True, last_summary or f"url={page.url}"
 
 
+def _resolve_github_repo(cwd: str = SCRIPT_DIR) -> tuple[str, str] | None:
+    """Parse GitHub (owner, repo) from the local git 'origin' remote URL."""
+    try:
+        res = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    url = (res.stdout or "").strip()
+    match = re.search(
+        r"github\.com[:/](?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?$",
+        url,
+    )
+    if not match:
+        return None
+    return match.group("owner"), match.group("repo")
+
+
+def _get_github_token_from_git(cwd: str = SCRIPT_DIR) -> str | None:
+    """Read a GitHub token from env or 'git credential fill' without ever logging it."""
+    for env_key in ("GH_TOKEN", "GITHUB_TOKEN"):
+        env_val = os.getenv(env_key, "").strip()
+        if env_val:
+            return env_val
+    try:
+        res = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        if line.startswith("password="):
+            token = line.split("=", 1)[1].strip()
+            if token:
+                return token
+    return None
+
+
+def _encrypt_github_secret(public_key_b64: str, secret_value: str) -> str:
+    """Encrypt secret_value with a GitHub Actions repo public key using PyNaCl SealedBox."""
+    from nacl import encoding, public
+
+    pub_key = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = public.SealedBox(pub_key)
+    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def _upload_secret_via_github_api(
+    secret_name: str, secret_value: str, cwd: str = SCRIPT_DIR
+) -> tuple[bool, str]:
+    """Upload a GitHub Actions secret via REST API using git credential fill + PyNaCl."""
+    repo_info = _resolve_github_repo(cwd)
+    if not repo_info:
+        return False, "GitHub 'origin' deposu tespit edilemedi."
+    owner, repo = repo_info
+
+    token = _get_github_token_from_git(cwd)
+    if not token:
+        return False, "Yerel git kimlik bilgisinden GitHub token alınamadı."
+
+    try:
+        import requests
+    except ImportError:
+        return False, "'requests' paketi kurulu değil."
+
+    try:
+        import nacl  # noqa: F401
+    except ImportError:
+        return False, "'pynacl' paketi kurulu değil (kurmak için: pip install pynacl)."
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+    base_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets"
+    try:
+        key_resp = requests.get(f"{base_url}/public-key", headers=headers, timeout=20)
+    except Exception as exc:
+        return False, f"GitHub public-key isteği başarısız: {exc}"
+
+    if key_resp.status_code != 200:
+        return False, f"GitHub public-key alınamadı (HTTP {key_resp.status_code})."
+
+    key_data = key_resp.json()
+    key_id = key_data.get("key_id")
+    pub_key = key_data.get("key")
+    if not key_id or not pub_key:
+        return False, "GitHub public-key yanıtı eksik."
+
+    try:
+        encrypted_value = _encrypt_github_secret(pub_key, secret_value)
+    except Exception as exc:
+        return False, f"Secret şifreleme hatası: {exc}"
+
+    try:
+        put_resp = requests.put(
+            f"{base_url}/{secret_name}",
+            headers=headers,
+            json={"encrypted_value": encrypted_value, "key_id": key_id},
+            timeout=20,
+        )
+    except Exception as exc:
+        return False, f"GitHub Secret yükleme isteği başarısız: {exc}"
+
+    if put_resp.status_code in (201, 204):
+        return True, f"{owner}/{repo}"
+    return False, f"GitHub Secret yükleme reddedildi (HTTP {put_resp.status_code})."
+
+
+def _upload_github_secret(
+    secret_name: str, secret_value: str, cwd: str = SCRIPT_DIR
+) -> bool:
+    """Upload a GitHub Actions secret via gh CLI when available, otherwise REST API."""
+    if shutil.which("gh"):
+        res = subprocess.run(
+            ["gh", "secret", "set", secret_name],
+            input=secret_value,
+            text=True,
+            cwd=cwd,
+            check=False,
+        )
+        if res.returncode == 0:
+            print(f"✅ GitHub Secret otomatik güncellendi (gh CLI): {secret_name}")
+            return True
+        print(
+            f"⚠️ gh secret set başarısız oldu (kod: {res.returncode}); "
+            "GitHub REST API ile yeniden deneniyor..."
+        )
+
+    ok, detail = _upload_secret_via_github_api(secret_name, secret_value, cwd=cwd)
+    if ok:
+        print(f"✅ GitHub Secret otomatik güncellendi (GitHub API, {detail}): {secret_name}")
+        return True
+    print(f"⚠️ GitHub Secret otomatik yüklenemedi ({detail}).")
+    return False
+
+
 def export_session(store: str, reuse_existing: bool = False, upload_secret: bool = False) -> None:
     """Open headed browser for manual login and export storage_state JSON + Base64."""
     from patchright.sync_api import sync_playwright
@@ -166,29 +323,15 @@ def export_session(store: str, reuse_existing: bool = False, upload_secret: bool
                         f"⚠️ Oturum doğrulanamadığı için {secret_name} otomatik yüklenmedi "
                         "(mevcut çalışan Secret korunuyor)."
                     )
-                elif shutil.which("gh"):
-                    res = subprocess.run(
-                        ["gh", "secret", "set", secret_name],
-                        input=encoded,
-                        text=True,
-                        cwd=SCRIPT_DIR,
-                        check=False,
-                    )
-                    if res.returncode == 0:
-                        print(f"✅ GitHub Secret otomatik güncellendi: {secret_name}")
-                    else:
-                        print(f"⚠️ gh secret set başarısız oldu (kod: {res.returncode}).")
                 else:
-                    print("⚠️ 'gh' CLI bulunamadı; GitHub Secret'ı manuel güncelleyin.")
+                    _upload_github_secret(secret_name, encoded, cwd=SCRIPT_DIR)
             else:
                 print(
-                    f"\nGitHub Secrets -> {secret_name} alanına aşağıdaki Base64 metni "
-                    f"yapıştırabilir veya şu komutu çalıştırabilirsiniz:\n"
-                    f"  gh secret set {secret_name} < {os.path.basename(b64_path)}"
+                    f"\nGüvenlik için Base64 oturum metni terminale yazdırılmadı.\n"
+                    f"Kaydedilen dosya: {b64_path}\n"
+                    f"GitHub Secrets -> {secret_name} otomatik yüklemek için:\n"
+                    f"  python export_session.py --store {store} --upload-secret"
                 )
-                print("-" * 60)
-                print(encoded)
-                print("-" * 60)
         finally:
             context.close()
             browser.close()

@@ -29,36 +29,24 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: "tracker.yml",
-              per_page: 15,
+              per_page: 20,
             });
 
-            const activeRun = runsData.workflow_runs.find((r) => activeStatuses.has(r.status));
-            if (activeRun) {
-              console.log(
-                `tracker.yml zaten aktif (run_id=${activeRun.id}, status=${activeRun.status}). Ek baslatma yapilmadi.`
-              );
-              return;
-            }
-
-            // --- Ardisik kisa/tam cokme korumasi ---
-            // Not: OXXO/Mango 5.5 saat calisip tek bir magaza fail oldugunda workflow 'failure'
-            // gorunse bile gercek bir sonsuz fail dongusu degildir. Ayrica tekil magaza manuel
-            // test kosulari (stores != 'all' veya max_run_minutes != '') retrigger job'unu
-            // 'skipped' biraktigi icin devre kesiciye sayilmamalidir; yalnizca tam 7/24
-            // kosularinda <10 dk icinde ust uste 3 kez cokme oldugunda devre kesici tetiklenir.
-            const completedRuns = runsData.workflow_runs
-              .filter((r) => r.status === "completed")
-              .slice(0, 10);
-
-            const isShortFailure = (r) => {
-              if (r.conclusion !== "failure") return false;
-              const startMs = new Date(r.run_started_at || r.created_at).getTime();
-              const endMs = new Date(r.updated_at || r.created_at).getTime();
-              const durSec = Math.max(0, Math.round((endMs - startMs) / 1000));
-              return durSec < 600;
-            };
-
-            const isFullChainRun = async (r) => {
+            // Tam 7/24 zincir kosusu ile manuel tekil/kisa test kosularini net ayirt et:
+            // Yeni kosularda run-name ('7/24 Takip Zinciri ...' vs 'Manuel Test ...')
+            // aninda ayrim saglar; eski/tamamlanmis kosularda retrigger job'unun
+            // 'skipped' olmasi yedek sinyal olarak kullanilir.
+            const isFullChainRun = async (r, { checkJobs = true } = {}) => {
+              const title = r.display_title || r.name || "";
+              if (title.startsWith("Manuel Test")) {
+                return false;
+              }
+              if (title.startsWith("7/24 Takip Zinciri")) {
+                return true;
+              }
+              if (!checkJobs) {
+                return true;
+              }
               try {
                 const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
                   owner: context.repo.owner,
@@ -80,20 +68,53 @@ jobs:
               }
             };
 
+            const activeRuns = runsData.workflow_runs.filter((r) => activeStatuses.has(r.status));
+            let activeFullRun = null;
+            for (const run of activeRuns) {
+              if (await isFullChainRun(run, { checkJobs: false })) {
+                activeFullRun = run;
+                break;
+              }
+              console.log(
+                `Aktif manuel/tekil test kosusu 7/24 zincirden haric tutuldu (run_id=${run.id}, title=${run.display_title || run.name || "?"}).`
+              );
+            }
+            if (activeFullRun) {
+              console.log(
+                `7/24 tracker.yml zaten aktif (run_id=${activeFullRun.id}, status=${activeFullRun.status}). Ek baslatma yapilmadi.`
+              );
+              return;
+            }
+
+            // --- Ardisik kisa/tam cokme korumasi ---
+            // Not: OXXO/Mango 5.5 saat calisip tek bir magaza fail oldugunda workflow 'failure'
+            // gorunse bile gercek bir sonsuz fail dongusu degildir. Ayrica tekil magaza manuel
+            // test kosulari (stores != 'all' veya max_run_minutes != '') retrigger job'unu
+            // 'skipped' biraktigi veya 'Manuel Test' basligi tasidigi icin devre kesiciye
+            // sayilmamalidir; yalnizca tam 7/24 kosularinda <10 dk icinde ust uste 3 kez
+            // cokme oldugunda devre kesici tetiklenir.
+            const completedRuns = runsData.workflow_runs
+              .filter((r) => r.status === "completed")
+              .slice(0, 15);
+
+            const isShortFailure = (r) => {
+              if (r.conclusion !== "failure") return false;
+              const startMs = new Date(r.run_started_at || r.created_at).getTime();
+              const endMs = new Date(r.updated_at || r.created_at).getTime();
+              const durSec = Math.max(0, Math.round((endMs - startMs) / 1000));
+              return durSec < 600;
+            };
+
             const recentFullRuns = [];
             for (const run of completedRuns) {
               if (recentFullRuns.length >= 3) break;
-              if (isShortFailure(run)) {
-                if (await isFullChainRun(run)) {
-                  recentFullRuns.push(run);
-                } else {
-                  console.log(
-                    `Tekil/kisa test kosusu devre kesici hesabindan haric tutuldu (run_id=${run.id}).`
-                  );
-                }
-              } else {
-                recentFullRuns.push(run);
+              if (!(await isFullChainRun(run))) {
+                console.log(
+                  `Tekil/kisa test kosusu devre kesici hesabindan haric tutuldu (run_id=${run.id}).`
+                );
+                continue;
               }
+              recentFullRuns.push(run);
             }
 
             const allShortFailed = recentFullRuns.length >= 3 &&

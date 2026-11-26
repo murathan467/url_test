@@ -26,6 +26,62 @@ from core.session import clear_session_valid_marker, save_store_session
 PAGE_RECYCLE_INTERVAL_CYCLES = 60
 SESSION_SAVE_INTERVAL_SECONDS = 900
 MAX_CONSECUTIVE_ERRORS = 12
+CYCLE_TIMEOUT_SECONDS = 180
+BROWSER_RESTART_ERROR_THRESHOLD = 3
+
+
+def _compute_cycle_sleep(cycle_elapsed: float, refresh_interval: float | None = None) -> float:
+    """Compute sleep duration targeting exact REFRESH_INTERVAL with a 3s safety floor."""
+    interval = float(REFRESH_INTERVAL if refresh_interval is None else refresh_interval)
+    min_sleep = min(3.0, interval)
+    return max(min_sleep, interval - cycle_elapsed)
+
+
+def _bounded_sleep_seconds(desired: float, remaining: float) -> float:
+    """Clamp sleep duration so error/cooldown waits never exceed remaining run budget."""
+    if remaining <= 0:
+        return 0.0
+    return max(0.0, min(desired, remaining))
+
+
+def _is_transport_or_closed_error(exc: Exception) -> bool:
+    """Return True for proxy drops, network disconnects, timeouts, or closed browser/page errors."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    msg = str(exc).lower()
+    markers = (
+        "target closed",
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "context has been closed",
+        "err_proxy",
+        "err_tunnel",
+        "err_connection",
+        "err_timed_out",
+        "err_network",
+        "err_internet",
+        "err_name_not_resolved",
+        "err_aborted",
+        "timeout",
+        "disconnected",
+    )
+    return any(m in msg for m in markers)
+
+
+async def _close_stray_tabs(context: BrowserContext, keep_page: Page | None) -> None:
+    """Close any extra open tabs in the context except keep_page."""
+    try:
+        pages = list(context.pages)
+    except Exception:
+        return
+    for p in pages:
+        if p is keep_page:
+            continue
+        try:
+            if not p.is_closed():
+                await asyncio.wait_for(p.close(), timeout=5)
+        except Exception:
+            pass
 
 
 def _normalize_tr_lower(text: str) -> str:
@@ -432,6 +488,114 @@ async def _wait_for_zara_wishlist_ready(
         await page.wait_for_timeout(500)
 
 
+PASSWORD_SWITCH_SELECTORS = [
+    "button:has-text('Şifre ile giriş yap')",
+    "a:has-text('Şifre ile giriş yap')",
+    "[role='button']:has-text('Şifre ile'), [role='link']:has-text('Şifre ile')",
+    "button:has-text('Parola ile'), a:has-text('Parola ile'), [role='button']:has-text('Parola ile')",
+    "button:has-text('Şifre ile oturum'), a:has-text('Şifre ile oturum')",
+    "button:has-text('Sign in with password'), a:has-text('Sign in with password'), [role='button']:has-text('Sign in with password')",
+    "button:has-text('Log in with password'), a:has-text('Log in with password'), button:has-text('Use password'), a:has-text('Use password')",
+    "text=/şifre ile giriş yap/i",
+    "text=/parola ile (giriş yap|oturum aç)/i",
+    "text=/şifre ile oturum aç/i",
+    "text=/(sign in|log in|use)\\s+.*password/i",
+]
+
+
+async def _click_password_switch_fallback_dom(page: Page) -> str | None:
+    """Fallback DOM click for OTP screens where the password switch is a span/div/custom link."""
+    try:
+        return await page.evaluate(
+            """
+            () => {
+                const norm = (s) => (s || "").replace(/[İIı]/g, "i").toLowerCase().replace(/\\u0307/g, "").replace(/\\s+/g, " ").trim();
+                const phrases = [
+                    "şifre ile giriş yap",
+                    "şifre ile oturum aç",
+                    "parola ile giriş yap",
+                    "parola ile oturum aç",
+                    "sign in with password",
+                    "log in with password",
+                    "use password",
+                ];
+                const candidates = Array.from(
+                    document.querySelectorAll("button, a, [role='button'], [role='link'], span, div, p")
+                );
+                let best = null;
+                let bestLen = Infinity;
+                for (const el of candidates) {
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === "hidden" || style.display === "none") continue;
+                    const txt = norm(el.innerText || el.textContent || "");
+                    if (!txt || txt.length > 60) continue;
+                    if (phrases.some(p => txt.includes(p)) && txt.length < bestLen) {
+                        best = el;
+                        bestLen = txt.length;
+                    }
+                }
+                if (!best) return null;
+                const target = best.closest("button, a, [role='button'], [role='link']") || best;
+                target.click();
+                return `${target.tagName.toLowerCase()}:${(target.innerText || "").trim().slice(0, 40)}`;
+            }
+            """
+        )
+    except Exception:
+        return None
+
+
+async def _switch_to_password_login(page: Page, pass_input, timeout_ms: int = 15000) -> bool:
+    """Wait for password input, switching from passwordless OTP screens when presented."""
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    last_click_at = 0.0
+
+    while time.monotonic() < deadline:
+        try:
+            if await pass_input.is_visible(timeout=350):
+                return True
+        except Exception:
+            pass
+
+        if await detect_block_or_captcha(page):
+            return False
+
+        url_lower = (page.url or "").lower()
+        is_otp_screen = (
+            "/passwordless-login" in url_lower or "/verify-otp" in url_lower
+        )
+        now = time.monotonic()
+        if (now - last_click_at) >= 2.5:
+            matched = await click_first_visible(
+                page,
+                PASSWORD_SWITCH_SELECTORS,
+                timeout_ms=250,
+                post_wait_ms=1200,
+            )
+            if not matched and is_otp_screen:
+                matched = await _click_password_switch_fallback_dom(page)
+                if matched:
+                    await page.wait_for_timeout(1200)
+            if matched:
+                last_click_at = time.monotonic()
+                screen_label = "OTP ekranından" if is_otp_screen else "giriş ekranından"
+                print(f"[Zara] {screen_label} şifre ile girişe geçildi ({matched}).")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass
+                continue
+
+        await page.wait_for_timeout(350)
+
+    try:
+        return await pass_input.is_visible(timeout=500)
+    except Exception:
+        return False
+
+
 async def _wait_for_login_redirect(page: Page, timeout_ms: int = 12000) -> bool:
     """Wait for Zara OAuth redirect to complete after submitting credentials."""
     deadline = time.monotonic() + (timeout_ms / 1000.0)
@@ -601,36 +765,18 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             "input[aria-label*='parola' i]:visible, input[aria-label*='şifre' i]:visible, "
             "input[aria-label*='password' i]:visible"
         ).first
-        pass_already_visible = False
-        try:
-            pass_already_visible = await pass_input.is_visible(timeout=2000)
-        except Exception:
-            pass
+        switched_or_ready = await _switch_to_password_login(page, pass_input, timeout_ms=15000)
 
-        if not pass_already_visible:
-            pwd_switch = await click_first_visible(
-                page,
-                [
-                    "button:has-text('PAROLA İLE OTURUM AÇ')",
-                    "button:has-text('Parola ile oturum aç')",
-                    "button:has-text('ŞİFRE İLE OTURUM AÇ')",
-                    "button:has-text('Şifre ile oturum aç')",
-                    "button:has-text('ŞİFRE İLE GİRİŞ YAP')",
-                    "button:has-text('Şifre ile giriş yap')",
-                    "button:has-text('PAROLA İLE GİRİŞ YAP')",
-                    "button:has-text('Parola ile giriş yap')",
-                    "button:has-text('Log in with password')",
-                    "a:has-text('Şifre ile')",
-                    "a:has-text('Parola ile')",
-                    "a:has-text('Log in with password')",
-                ],
-                timeout_ms=1500,
-                post_wait_ms=1500,
+        post_switch_block = await detect_block_or_captcha(page)
+        if post_switch_block:
+            print(
+                f"[HATA] Şifre ekranına geçişte Captcha/WAF veya 'Bir sorun oluştu' tetiklendi "
+                f"(neden={post_switch_block}) -> {await _safe_page_diagnostics(page)}"
             )
-            if pwd_switch:
-                print(f"[Zara] Parola ile giriş seçeneğine geçildi ({pwd_switch}).")
+            return False
 
-        await pass_input.wait_for(state="visible", timeout=15000)
+        if not switched_or_ready:
+            await pass_input.wait_for(state="visible", timeout=10000)
         await human_type(pass_input, COMMON_PASSWORD)
         await page.wait_for_timeout(800)
 
@@ -914,10 +1060,255 @@ async def _recycle_favorites_page(
     return new_page, new_monitor
 
 
+async def _restart_zara_session(
+    active_context: BrowserContext,
+    owned_browser,
+    owned_playwright,
+    favorites_page: Page | None,
+    loop_monitor: _ZaraNetworkMonitor | None,
+    preserve_state: bool = True,
+):
+    """Tear down a wedged/closed Zara browser context and launch a fresh one from saved storage_state."""
+    if loop_monitor is not None:
+        loop_monitor.stop()
+    await _close_stray_tabs(active_context, None)
+    if favorites_page is not None:
+        try:
+            if not favorites_page.is_closed():
+                await asyncio.wait_for(favorites_page.close(), timeout=5)
+        except Exception:
+            pass
+
+    if preserve_state:
+        try:
+            await asyncio.wait_for(
+                save_store_session(active_context, "zara", mark_valid=False),
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    browser_to_close = owned_browser if owned_browser is not None else getattr(active_context, "browser", None)
+    try:
+        await asyncio.wait_for(active_context.close(), timeout=5)
+    except Exception:
+        pass
+    if browser_to_close is not None:
+        try:
+            await asyncio.wait_for(browser_to_close.close(), timeout=5)
+        except Exception:
+            pass
+    if owned_playwright is not None:
+        try:
+            await asyncio.wait_for(owned_playwright.stop(), timeout=5)
+        except Exception:
+            pass
+
+    from patchright.async_api import async_playwright
+    from core.browser import launch_store_browser
+
+    new_pw = await async_playwright().start()
+    try:
+        new_browser, new_context = await launch_store_browser(new_pw, "zara")
+    except Exception:
+        try:
+            await new_pw.stop()
+        except Exception:
+            pass
+        raise
+
+    new_page = await new_context.new_page()
+    new_monitor = _ZaraNetworkMonitor(new_page, capture_details=False)
+    return new_pw, new_browser, new_context, new_page, new_monitor
+
+
+async def _run_zara_cycle(
+    context: BrowserContext,
+    favorites_page: Page,
+    loop_monitor: _ZaraNetworkMonitor,
+    notifier: StockWaveNotifier,
+    sem: asyncio.Semaphore,
+    cycle: int,
+    state_bag: dict,
+) -> tuple[str, Page, _ZaraNetworkMonitor]:
+    """Execute one bounded Zara wishlist poll + concurrent size verification cycle."""
+    needs_recycle = (
+        favorites_page.is_closed()
+        or (cycle > 1 and cycle % PAGE_RECYCLE_INTERVAL_CYCLES == 0)
+    )
+    if needs_recycle:
+        print(f"[Zara] Bellek temizliği için favori sekmesi yenileniyor (Tur #{cycle})...")
+        favorites_page, loop_monitor = await _recycle_favorites_page(
+            context, favorites_page, loop_monitor, capture_details=False
+        )
+        await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=35000, retries=2)
+    elif cycle > 1:
+        if not await safe_reload_or_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=35000):
+            return "reload_failed", favorites_page, loop_monitor
+
+    await _wait_for_zara_wishlist_ready(
+        favorites_page, monitor=loop_monitor, timeout_ms=10000
+    )
+    await handle_country_and_cookies(favorites_page)
+
+    if await has_block_or_captcha(favorites_page):
+        return "blocked", favorites_page, loop_monitor
+
+    current_url = (favorites_page.url or "").lower()
+    if (
+        "logon" in current_url
+        or "login" in current_url
+        or "account.zara.com" in current_url
+        or loop_monitor.has_auth_failure()
+    ):
+        print(
+            "[UYARI] Zara oturumu düştü "
+            f"(url={current_url}, auth_err={loop_monitor.auth_failures}), yeniden giriş deneniyor..."
+        )
+        clear_session_valid_marker("zara")
+        if not await ensure_zara_login(context, favorites_page):
+            return "fatal_auth", favorites_page, loop_monitor
+        state_bag["last_session_save"] = time.time()
+        return "relogged", favorites_page, loop_monitor
+
+    if "/tr/tr" not in current_url or not any(
+        k in current_url for k in ("wishlist", "lists", "saved")
+    ):
+        print("[UYARI] Zara favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
+        await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=35000, retries=2)
+        await _wait_for_zara_wishlist_ready(
+            favorites_page, monitor=loop_monitor, timeout_ms=10000
+        )
+        await handle_country_and_cookies(favorites_page)
+        current_url = (favorites_page.url or "").lower()
+        if (
+            "logon" in current_url
+            or "login" in current_url
+            or "account.zara.com" in current_url
+            or loop_monitor.has_auth_failure()
+        ):
+            print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
+            clear_session_valid_marker("zara")
+            if not await ensure_zara_login(context, favorites_page):
+                return "fatal_auth", favorites_page, loop_monitor
+            state_bag["last_session_save"] = time.time()
+            return "relogged", favorites_page, loop_monitor
+
+    await scroll_page_to_bottom(favorites_page)
+
+    extracted = await _extract_stock_and_discounted_items(favorites_page)
+    total = extracted.get("total", 0)
+    in_stock = extracted.get("in_stock", 0)
+    candidates = extracted.get("items", [])
+    print(
+        f"[Zara] Favorilerde toplam {total} ürün tarandı "
+        f"(stokta: {in_stock}, stokta+indirimde: {len(candidates)})."
+    )
+    if cycle in (1, 2) and total == 0:
+        print(f"[Zara] Tur #{cycle} DOM teşhis -> {await _zara_dom_diagnostics(favorites_page)}")
+        print(
+            f"[Zara] Tur #{cycle} Ağ teşhis ({len(loop_monitor.logs)} yanıt) -> {loop_monitor.logs}"
+        )
+
+    if total == 0:
+        loop_state = await _inspect_zara_page(favorites_page)
+        if (
+            loop_state["has_login_url"]
+            or loop_state["has_login_form"]
+            or loop_state["has_login_cta_in_main"]
+            or loop_monitor.has_auth_failure()
+        ):
+            print(
+                "[UYARI] Zara oturumu sayfa içinde düştü "
+                "(login_cta/form/API reddi algılandı), yeniden giriş deneniyor..."
+            )
+            clear_session_valid_marker("zara")
+            if not await ensure_zara_login(context, favorites_page):
+                return "fatal_auth", favorites_page, loop_monitor
+            state_bag["last_session_save"] = time.time()
+            return "relogged", favorites_page, loop_monitor
+
+        if loop_monitor.has_wishlist_server_error():
+            print(
+                f"[UYARI] Zara wishlist API sunucu hatası ({loop_monitor.api_server_errors}); "
+                "yanlış 'stok tükendi' bildirimi önleniyor."
+            )
+            return "server_error", favorites_page, loop_monitor
+
+        state_bag["consecutive_empty_cycles"] += 1
+        if (
+            state_bag["had_products_before"]
+            and state_bag["consecutive_empty_cycles"] < 2
+            and not loop_state["has_empty_wishlist_text"]
+        ):
+            print(
+                "[UYARI] Favori listesi geçici olarak 0 ürün döndü; "
+                "yanlış 'stok tükendi' bildirimi atlanıyor, sonraki tur doğrulanacak."
+            )
+            return "empty_retry", favorites_page, loop_monitor
+    else:
+        state_bag["had_products_before"] = True
+        state_bag["consecutive_empty_cycles"] = 0
+
+    matched_items: list[dict] = []
+    errored_urls: set[str] = set()
+    errored_tabs = 0
+    if candidates:
+        results = await asyncio.gather(
+            *[_open_and_check_tab(context, prod, sem) for prod in candidates],
+            return_exceptions=True,
+        )
+        for prod, res in zip(candidates, results):
+            if isinstance(res, Exception):
+                errored_tabs += 1
+                if prod.get("url"):
+                    errored_urls.add(prod["url"])
+            else:
+                status, item = res
+                if status == "match" and item is not None:
+                    matched_items.append(item)
+                elif status == "error":
+                    errored_tabs += 1
+                    if prod.get("url"):
+                        errored_urls.add(prod["url"])
+
+    if candidates and errored_tabs == len(candidates):
+        print(
+            "[UYARI] Zara tüm ürün sekmeleri hata verdi; yanlış 'Stok Tükendi' "
+            "önlemek için bildirim değerlendirmesi atlandı."
+        )
+    else:
+        notifier.process_cycle(matched_items, uncertain_urls=errored_urls)
+
+    now = time.time()
+    if (now - state_bag["last_session_save"]) >= SESSION_SAVE_INTERVAL_SECONDS and (
+        total > 0 or loop_monitor.wishlist_api_succeeded()
+    ):
+        await save_store_session(context, "zara", mark_valid=True)
+        state_bag["last_session_save"] = now
+
+    return "ok", favorites_page, loop_monitor
+
+
 async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
-    """Run Zara wishlist polling loop with bounded concurrent size verification."""
-    favorites_page = await context.new_page()
-    if not await ensure_zara_login(context, favorites_page):
+    """Run Zara wishlist polling loop with per-cycle timeout, live browser recovery, and 30s cadence."""
+    active_context = context
+    owned_browser = None
+    owned_playwright = None
+    favorites_page = await active_context.new_page()
+
+    try:
+        logged_in = await asyncio.wait_for(
+            ensure_zara_login(active_context, favorites_page),
+            timeout=CYCLE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        print(
+            f"[HATA] Zara başlangıç girişi {CYCLE_TIMEOUT_SECONDS} sn zaman aşımına uğradı."
+        )
+        logged_in = False
+
+    if not logged_in:
         try:
             if not favorites_page.is_closed():
                 await favorites_page.close()
@@ -925,20 +1316,72 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
             pass
         send_telegram_message(
             "🚨 Zara oturumu açılamadı (OAuth süresi dolmuş veya WAF/Captcha engeli). "
-            "Yerelde 'python export_session.py --store zara' (giris_zara.bat) ile ZARA_STORAGE_STATE secret'ını yenileyin."
+            "Yerelde 'python export_session.py --store zara --upload-secret' (giris_zara.bat) ile "
+            "ZARA_STORAGE_STATE secret'ını yenileyin."
         )
         return False
 
     notifier = StockWaveNotifier("ZARA")
     start_time = time.time()
-    last_session_save = start_time
     max_seconds = max_run_minutes * 60 if max_run_minutes > 0 else float("inf")
     cycle = 0
     consecutive_errors = 0
-    consecutive_empty_cycles = 0
-    had_products_before = False
+    consecutive_transport_errors = 0
+    state_bag = {
+        "last_session_save": start_time,
+        "consecutive_empty_cycles": 0,
+        "had_products_before": False,
+    }
     sem = asyncio.Semaphore(3)
     loop_monitor = _ZaraNetworkMonitor(favorites_page, capture_details=True)
+    completed_ok = False
+
+    async def _sleep_bounded(desired: float) -> bool:
+        """Sleep up to desired seconds without exceeding remaining budget; return False if budget ended."""
+        remaining = max_seconds - (time.time() - start_time)
+        sleep_s = _bounded_sleep_seconds(desired, remaining)
+        if sleep_s <= 0:
+            return False
+        await asyncio.sleep(sleep_s)
+        return (time.time() - start_time) < max_seconds
+
+    async def _attempt_live_browser_restart(reason: str) -> bool:
+        """Restart browser+context preserving saved storage_state and re-verify Zara session."""
+        nonlocal active_context, owned_browser, owned_playwright, favorites_page, loop_monitor
+        nonlocal consecutive_transport_errors, consecutive_errors
+        print(
+            f"[UYARI] Zara tarayıcı/proxy oturumu canlı olarak yeniden başlatılıyor ({reason})..."
+        )
+        try:
+            (
+                owned_playwright,
+                owned_browser,
+                active_context,
+                favorites_page,
+                loop_monitor,
+            ) = await _restart_zara_session(
+                active_context,
+                owned_browser,
+                owned_playwright,
+                favorites_page,
+                loop_monitor,
+                preserve_state=state_bag["had_products_before"],
+            )
+            re_ok = await asyncio.wait_for(
+                ensure_zara_login(active_context, favorites_page),
+                timeout=CYCLE_TIMEOUT_SECONDS,
+            )
+            if not re_ok:
+                print("[HATA] Zara canlı yeniden başlatma sonrası oturum doğrulanamadı.")
+                return False
+            state_bag["last_session_save"] = time.time()
+            consecutive_transport_errors = 0
+            consecutive_errors = 0
+            print("[Zara] ✅ Tarayıcı ve oturum canlı olarak kurtarıldı, taramaya devam ediliyor.")
+            return True
+        except Exception as restart_exc:
+            print(f"[HATA] Zara canlı tarayıcı yeniden başlatma başarısız: {restart_exc}")
+            return False
 
     try:
         while (time.time() - start_time) < max_seconds:
@@ -947,206 +1390,56 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
             loop_monitor.reset_cycle(capture_details=(cycle <= 2))
             print(f"\n[ZARA — Tur #{cycle}] Favoriler yenileniyor...")
 
+            outcome = "error"
             try:
-                # Periodically recycle the wishlist page to prevent 6h SPA renderer heap growth.
-                needs_recycle = (
-                    favorites_page.is_closed()
-                    or (cycle > 1 and cycle % PAGE_RECYCLE_INTERVAL_CYCLES == 0)
+                outcome, favorites_page, loop_monitor = await asyncio.wait_for(
+                    _run_zara_cycle(
+                        active_context,
+                        favorites_page,
+                        loop_monitor,
+                        notifier,
+                        sem,
+                        cycle,
+                        state_bag,
+                    ),
+                    timeout=CYCLE_TIMEOUT_SECONDS,
                 )
-                if needs_recycle:
-                    print(f"[Zara] Bellek temizliği için favori sekmesi yenileniyor (Tur #{cycle})...")
-                    favorites_page, loop_monitor = await _recycle_favorites_page(
-                        context, favorites_page, loop_monitor, capture_details=False
-                    )
-                    await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=35000, retries=2)
-                elif cycle > 1:
-                    if not await safe_reload_or_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=35000):
-                        consecutive_errors += 1
-                        print(
-                            f"[UYARI] Zara sayfa yenileme başarısız "
-                            f"(ardışık hata: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS})."
-                        )
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            send_telegram_message(
-                                "🚨 Zara takip botu ardışık bağlantı/proxy hataları nedeniyle durdu."
-                            )
-                            return False
-                        if consecutive_errors % 3 == 0:
-                            favorites_page, loop_monitor = await _recycle_favorites_page(
-                                context, favorites_page, loop_monitor, capture_details=False
-                            )
-                        await asyncio.sleep(
-                            ERROR_COOLDOWN if consecutive_errors >= 3 else REFRESH_INTERVAL
-                        )
-                        continue
-
-                await _wait_for_zara_wishlist_ready(
-                    favorites_page, monitor=loop_monitor, timeout_ms=10000
-                )
-                await handle_country_and_cookies(favorites_page)
-
-                if await has_block_or_captcha(favorites_page):
-                    consecutive_errors += 1
-                    print(
-                        f"[UYARI] Zara geçici engeli/CAPTCHA algılandı "
-                        f"({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}), {ERROR_COOLDOWN} sn bekleniyor..."
-                    )
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        send_telegram_message(
-                            "🚨 Zara takip botunda sürekli WAF/CAPTCHA engeli algılandı; çalışma durduruldu."
-                        )
-                        return False
-                    await asyncio.sleep(ERROR_COOLDOWN)
-                    continue
-
-                current_url = (favorites_page.url or "").lower()
-                if (
-                    "logon" in current_url
-                    or "login" in current_url
-                    or "account.zara.com" in current_url
-                    or loop_monitor.has_auth_failure()
-                ):
-                    print(
-                        "[UYARI] Zara oturumu düştü "
-                        f"(url={current_url}, auth_err={loop_monitor.auth_failures}), yeniden giriş deneniyor..."
-                    )
-                    clear_session_valid_marker("zara")
-                    if not await ensure_zara_login(context, favorites_page):
-                        send_telegram_message(
-                            "🚨 Zara oturumu düştü ve yenilenemedi. "
-                            "Yerelde giris_zara.bat ile ZARA_STORAGE_STATE secret'ını yenileyin."
-                        )
-                        return False
-                    last_session_save = time.time()
-                    consecutive_errors = 0
-                    continue
-
-                if "/tr/tr" not in current_url or not any(
-                    k in current_url for k in ("wishlist", "lists", "saved")
-                ):
-                    print("[UYARI] Zara favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
-                    await safe_goto(favorites_page, ZARA_FAVORITES_URL, timeout_ms=35000, retries=2)
-                    await _wait_for_zara_wishlist_ready(
-                        favorites_page, monitor=loop_monitor, timeout_ms=10000
-                    )
-                    await handle_country_and_cookies(favorites_page)
-                    current_url = (favorites_page.url or "").lower()
-                    if (
-                        "logon" in current_url
-                        or "login" in current_url
-                        or "account.zara.com" in current_url
-                        or loop_monitor.has_auth_failure()
-                    ):
-                        print("[UYARI] Zara oturumu düştü, yeniden giriş deneniyor...")
-                        clear_session_valid_marker("zara")
-                        if not await ensure_zara_login(context, favorites_page):
-                            send_telegram_message("🚨 Zara oturumu düştü ve yenilenemedi.")
-                            return False
-                        last_session_save = time.time()
-                        consecutive_errors = 0
-                        continue
-
-                await scroll_page_to_bottom(favorites_page)
-
-                extracted = await _extract_stock_and_discounted_items(favorites_page)
-                total = extracted.get("total", 0)
-                in_stock = extracted.get("in_stock", 0)
-                candidates = extracted.get("items", [])
+            except asyncio.TimeoutError:
+                consecutive_errors += 1
+                consecutive_transport_errors += 1
                 print(
-                    f"[Zara] Favorilerde toplam {total} ürün tarandı "
-                    f"(stokta: {in_stock}, stokta+indirimde: {len(candidates)})."
+                    f"[HATA] Zara tur #{cycle} {CYCLE_TIMEOUT_SECONDS} sn zaman aşımına uğradı "
+                    f"(ardışık hata: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}, "
+                    f"taşıma/timeout: {consecutive_transport_errors}/{BROWSER_RESTART_ERROR_THRESHOLD})."
                 )
-                if cycle in (1, 2) and total == 0:
-                    print(f"[Zara] Tur #{cycle} DOM teşhis -> {await _zara_dom_diagnostics(favorites_page)}")
-                    print(
-                        f"[Zara] Tur #{cycle} Ağ teşhis ({len(loop_monitor.logs)} yanıt) -> {loop_monitor.logs}"
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    send_telegram_message(
+                        "🚨 Zara takip botu ardışık zaman aşımı/proxy hataları nedeniyle durdu."
                     )
-
-                if total == 0:
-                    loop_state = await _inspect_zara_page(favorites_page)
-                    if (
-                        loop_state["has_login_url"]
-                        or loop_state["has_login_form"]
-                        or loop_state["has_login_cta_in_main"]
-                        or loop_monitor.has_auth_failure()
-                    ):
-                        print(
-                            "[UYARI] Zara oturumu sayfa içinde düştü "
-                            "(login_cta/form/API reddi algılandı), yeniden giriş deneniyor..."
-                        )
-                        clear_session_valid_marker("zara")
-                        if not await ensure_zara_login(context, favorites_page):
-                            send_telegram_message(
-                                "🚨 Zara oturumu düştü ve yenilenemedi. "
-                                "Yerelde giris_zara.bat ile ZARA_STORAGE_STATE secret'ını yenileyin."
-                            )
-                            return False
-                        last_session_save = time.time()
-                        consecutive_errors = 0
-                        continue
-
-                    if loop_monitor.has_wishlist_server_error():
-                        consecutive_errors += 1
-                        print(
-                            f"[UYARI] Zara wishlist API sunucu hatası ({loop_monitor.api_server_errors}); "
-                            "yanlış 'stok tükendi' bildirimi önleniyor."
-                        )
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-
-                    consecutive_empty_cycles += 1
-                    if had_products_before and consecutive_empty_cycles < 2 and not loop_state["has_empty_wishlist_text"]:
-                        print(
-                            "[UYARI] Favori listesi geçici olarak 0 ürün döndü; "
-                            "yanlış 'stok tükendi' bildirimi atlanıyor, sonraki tur doğrulanacak."
-                        )
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-                else:
-                    had_products_before = True
-                    consecutive_empty_cycles = 0
-
-                consecutive_errors = 0
-
-                matched_items: list[dict] = []
-                errored_urls: set[str] = set()
-                errored_tabs = 0
-                if candidates:
-                    results = await asyncio.gather(
-                        *[_open_and_check_tab(context, prod, sem) for prod in candidates],
-                        return_exceptions=True,
+                    return False
+                if consecutive_transport_errors >= BROWSER_RESTART_ERROR_THRESHOLD:
+                    restarted = await _attempt_live_browser_restart("ardışık 3 tur timeout")
+                    if not restarted:
+                        if not await _sleep_bounded(ERROR_COOLDOWN):
+                            break
+                    continue
+                try:
+                    favorites_page, loop_monitor = await asyncio.wait_for(
+                        _recycle_favorites_page(
+                            active_context, favorites_page, loop_monitor, capture_details=False
+                        ),
+                        timeout=15,
                     )
-                    for prod, res in zip(candidates, results):
-                        if isinstance(res, Exception):
-                            errored_tabs += 1
-                            if prod.get("url"):
-                                errored_urls.add(prod["url"])
-                        else:
-                            status, item = res
-                            if status == "match" and item is not None:
-                                matched_items.append(item)
-                            elif status == "error":
-                                errored_tabs += 1
-                                if prod.get("url"):
-                                    errored_urls.add(prod["url"])
-
-                if candidates and errored_tabs == len(candidates):
-                    print(
-                        "[UYARI] Zara tüm ürün sekmeleri hata verdi; yanlış 'Stok Tükendi' "
-                        "önlemek için bildirim değerlendirmesi atlandı."
-                    )
-                else:
-                    notifier.process_cycle(matched_items, uncertain_urls=errored_urls)
-
-                now = time.time()
-                if (now - last_session_save) >= SESSION_SAVE_INTERVAL_SECONDS and (
-                    total > 0 or loop_monitor.wishlist_api_succeeded()
-                ):
-                    await save_store_session(context, "zara", mark_valid=True)
-                    last_session_save = now
-
+                except Exception:
+                    await _attempt_live_browser_restart("timeout sonrası sekme yenileme hatası")
+                if not await _sleep_bounded(REFRESH_INTERVAL):
+                    break
+                continue
             except Exception as exc:
                 consecutive_errors += 1
+                is_transport = _is_transport_or_closed_error(exc)
+                if is_transport:
+                    consecutive_transport_errors += 1
                 print(
                     f"[HATA] Zara tur #{cycle} beklenmeyen hata "
                     f"(ardışık: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {exc}"
@@ -1156,21 +1449,113 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
                         "🚨 Zara takip botu ardışık hatalar nedeniyle durdu (proxy veya sayfa hatası)."
                     )
                     return False
+
+                browser_obj = getattr(active_context, "browser", None)
+                browser_dead = bool(
+                    browser_obj is not None
+                    and hasattr(browser_obj, "is_connected")
+                    and not browser_obj.is_connected()
+                )
+                if browser_dead or consecutive_transport_errors >= BROWSER_RESTART_ERROR_THRESHOLD:
+                    restarted = await _attempt_live_browser_restart(
+                        "tarayıcı bağlantısı koptu" if browser_dead else "ardışık 3 taşıma/TargetClosed hatası"
+                    )
+                    if not restarted:
+                        if not await _sleep_bounded(ERROR_COOLDOWN):
+                            break
+                    continue
+
                 if consecutive_errors % 3 == 0 or favorites_page.is_closed():
                     try:
                         favorites_page, loop_monitor = await _recycle_favorites_page(
-                            context, favorites_page, loop_monitor, capture_details=False
+                            active_context, favorites_page, loop_monitor, capture_details=False
                         )
                     except Exception as recycle_exc:
                         print(f"[HATA] Zara sekmesi yenilenemedi: {recycle_exc}")
-                await asyncio.sleep(
-                    ERROR_COOLDOWN if consecutive_errors >= 3 else REFRESH_INTERVAL
+                        await _attempt_live_browser_restart("sekme yenileme başarısız")
+                desired_wait = ERROR_COOLDOWN if consecutive_errors >= 3 else REFRESH_INTERVAL
+                if not await _sleep_bounded(desired_wait):
+                    break
+                continue
+            finally:
+                await _close_stray_tabs(active_context, favorites_page)
+
+            if outcome == "fatal_auth":
+                send_telegram_message(
+                    "🚨 Zara oturumu düştü ve yenilenemedi. "
+                    "Yerelde giris_zara.bat ile ZARA_STORAGE_STATE secret'ını yenileyin."
                 )
+                return False
+
+            if outcome == "reload_failed":
+                consecutive_errors += 1
+                consecutive_transport_errors += 1
+                print(
+                    f"[UYARI] Zara sayfa yenileme başarısız "
+                    f"(ardışık hata: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}, "
+                    f"taşıma: {consecutive_transport_errors}/{BROWSER_RESTART_ERROR_THRESHOLD})."
+                )
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    send_telegram_message(
+                        "🚨 Zara takip botu ardışık bağlantı/proxy hataları nedeniyle durdu."
+                    )
+                    return False
+                if consecutive_transport_errors >= BROWSER_RESTART_ERROR_THRESHOLD:
+                    restarted = await _attempt_live_browser_restart("ardışık 3 sayfa yenileme hatası")
+                    if not restarted:
+                        if not await _sleep_bounded(ERROR_COOLDOWN):
+                            break
+                    continue
+                desired_wait = ERROR_COOLDOWN if consecutive_errors >= 3 else REFRESH_INTERVAL
+                if not await _sleep_bounded(desired_wait):
+                    break
                 continue
 
+            if outcome == "blocked":
+                consecutive_errors += 1
+                consecutive_transport_errors = 0
+                print(
+                    f"[UYARI] Zara geçici engeli/CAPTCHA algılandı "
+                    f"({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}), {ERROR_COOLDOWN} sn bekleniyor..."
+                )
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    send_telegram_message(
+                        "🚨 Zara takip botunda sürekli WAF/CAPTCHA engeli algılandı; çalışma durduruldu."
+                    )
+                    return False
+                if not await _sleep_bounded(ERROR_COOLDOWN):
+                    break
+                continue
+
+            if outcome == "server_error":
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    send_telegram_message(
+                        "🚨 Zara wishlist API sürekli sunucu hatası döndürdüğü için çalışma durduruldu."
+                    )
+                    return False
+                if not await _sleep_bounded(REFRESH_INTERVAL):
+                    break
+                continue
+
+            if outcome == "relogged":
+                consecutive_errors = 0
+                consecutive_transport_errors = 0
+                continue
+
+            if outcome == "empty_retry":
+                consecutive_errors = 0
+                consecutive_transport_errors = 0
+                if not await _sleep_bounded(REFRESH_INTERVAL):
+                    break
+                continue
+
+            # outcome == "ok"
+            consecutive_errors = 0
+            consecutive_transport_errors = 0
+
             cycle_elapsed = time.time() - cycle_start
-            min_sleep = min(10.0, float(REFRESH_INTERVAL))
-            sleep_for = max(min_sleep, float(REFRESH_INTERVAL) - cycle_elapsed)
+            sleep_for = _compute_cycle_sleep(cycle_elapsed)
             remaining = max_seconds - (time.time() - start_time)
             if remaining <= sleep_for:
                 break
@@ -1180,12 +1565,31 @@ async def run_zara_loop(context: BrowserContext, max_run_minutes: int) -> bool:
                 f"{sleep_for:.1f} sn bekleniyor..."
             )
             await asyncio.sleep(sleep_for)
+
+        completed_ok = True
     finally:
         loop_monitor.stop()
+        await _close_stray_tabs(active_context, favorites_page)
         try:
             if not favorites_page.is_closed():
-                await favorites_page.close()
+                await asyncio.wait_for(favorites_page.close(), timeout=5)
         except Exception:
             pass
+        if owned_browser is not None:
+            if completed_ok:
+                await save_store_session(active_context, "zara", mark_valid=True)
+            try:
+                await asyncio.wait_for(active_context.close(), timeout=5)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(owned_browser.close(), timeout=5)
+            except Exception:
+                pass
+            if owned_playwright is not None:
+                try:
+                    await asyncio.wait_for(owned_playwright.stop(), timeout=5)
+                except Exception:
+                    pass
 
     return True

@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from collections.abc import Callable
-from patchright.async_api import BrowserContext, Page, Response
+from patchright.async_api import Browser, BrowserContext, Page, Response
 from config import (
     COMMON_EMAIL,
     COMMON_PASSWORD,
@@ -13,9 +13,14 @@ from config import (
     TARGET_SIZES,
 )
 from core.browser import (
+    cleanup_owned_playwright,
     click_first_visible,
+    close_browser_safely,
+    compute_cycle_sleep,
     human_type,
+    is_target_closed_error,
     page_diagnostics,
+    relaunch_store_browser,
     safe_goto,
     safe_reload_or_goto,
 )
@@ -23,6 +28,9 @@ from core.notifier import StockWaveNotifier, send_telegram_message
 from core.session import clear_session_valid_marker, save_store_session
 
 OUTAGE_ALERT_THRESHOLD = 10
+MAX_CONSECUTIVE_ERRORS = 12
+BROWSER_RESTART_ERROR_THRESHOLD = 3
+CYCLE_TIMEOUT_SECONDS = 180
 SESSION_SAVE_EVERY_CYCLES = 10
 RECYCLE_TAB_EVERY_CYCLES = 60
 
@@ -760,18 +768,22 @@ async def _open_and_check_tab(
             if tab is not None:
                 try:
                     if not tab.is_closed():
-                        await tab.close()
+                        await asyncio.wait_for(tab.close(), timeout=5.0)
                 except Exception:
                     pass
 
 
 async def _close_stray_tabs(context: BrowserContext, keep_page: Page) -> None:
     """Close any unexpected extra tabs so 7/24 polling never leaks memory."""
-    for p in list(context.pages):
+    try:
+        pages = list(context.pages)
+    except Exception:
+        return
+    for p in pages:
         if p is not keep_page:
             try:
                 if not p.is_closed():
-                    await p.close()
+                    await asyncio.wait_for(p.close(), timeout=5.0)
             except Exception:
                 pass
 
@@ -789,10 +801,22 @@ def _format_login_failure_alert(reason: str, mid_run: bool = False) -> str:
 
 
 async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
-    """Run Mango favorites polling loop with bounded concurrent discount + size checks."""
-    favorites_page = await context.new_page()
+    """Run Mango favorites polling loop with bounded cycle timeouts and live browser recovery."""
+    original_context = context
+    active_context = context
+    active_browser: Browser | None = getattr(context, "browser", None)
+    favorites_page = await active_context.new_page()
+
     try:
-        ok, reason = await _ensure_mango_login_with_reason(context, favorites_page)
+        try:
+            ok, reason = await asyncio.wait_for(
+                _ensure_mango_login_with_reason(active_context, favorites_page),
+                timeout=CYCLE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            print(f"[HATA] Mango başlangıç oturum kontrolü zaman aşımına uğradı (>{CYCLE_TIMEOUT_SECONDS} sn).")
+            ok, reason = False, "network_error"
+
         if not ok:
             send_telegram_message(_format_login_failure_alert(reason, mid_run=False))
             return False
@@ -807,222 +831,320 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
         consecutive_empty_reads = 0
         consecutive_reload_failures = 0
         consecutive_loop_errors = 0
+        consecutive_block_errors = 0
         outage_alert_sent = False
+        needs_session_reverify = False
+
+        async def _restart_browser_and_page() -> None:
+            nonlocal active_browser, active_context, favorites_page, needs_session_reverify
+            new_browser, new_context = await relaunch_store_browser(
+                "mango",
+                old_context=active_context,
+                old_browser=active_browser,
+            )
+            active_browser = new_browser
+            active_context = new_context
+            favorites_page = await active_context.new_page()
+            needs_session_reverify = True
+
+        async def _execute_cycle() -> str:
+            nonlocal favorites_page, last_known_total, consecutive_empty_reads
+            nonlocal consecutive_reload_failures, outage_alert_sent, needs_session_reverify
+
+            if needs_session_reverify:
+                if favorites_page.is_closed():
+                    favorites_page = await active_context.new_page()
+                re_ok, re_reason = await _ensure_mango_login_with_reason(active_context, favorites_page)
+                if not re_ok:
+                    if re_reason == "network_error":
+                        return "reverify_network_error"
+                    if re_reason == "blocked":
+                        return "blocked"
+                    send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
+                    return "fatal"
+                needs_session_reverify = False
+                needs_navigation = False
+            else:
+                needs_navigation = cycle > 1
+                if favorites_page.is_closed():
+                    print("[UYARI] Mango favoriler sekmesi kapanmış, yeniden açılıyor...")
+                    favorites_page = await active_context.new_page()
+                    needs_navigation = True
+                elif cycle > 1 and cycle % RECYCLE_TAB_EVERY_CYCLES == 0:
+                    print("[Mango] Bellek temizliği için favoriler sekmesi yenileniyor...")
+                    try:
+                        await asyncio.wait_for(favorites_page.close(), timeout=5.0)
+                    except Exception:
+                        pass
+                    favorites_page = await active_context.new_page()
+                    needs_navigation = True
+
+            if needs_navigation:
+                if not await safe_reload_or_goto(
+                    favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000
+                ):
+                    return "reload_failed"
+
+            if consecutive_reload_failures > 0:
+                if outage_alert_sent:
+                    print("[Mango] ✅ Bağlantı/proxy erişimi tekrar sağlandı.")
+                    outage_alert_sent = False
+                consecutive_reload_failures = 0
+
+            wait_ms = 12000 if (cycle == 1 or last_known_total > 0) else 8000
+            ready_state = await _wait_for_mango_favorites_ready(favorites_page, timeout_ms=wait_ms)
+
+            if ready_state == "blocked" or await has_block_or_captcha(favorites_page):
+                return "blocked"
+
+            current_url = (favorites_page.url or "").lower()
+            if "login" in current_url or "signin" in current_url:
+                print("[UYARI] Mango oturumu düştü, yeniden giriş deneniyor...")
+                clear_session_valid_marker("mango")
+                re_ok, re_reason = await _ensure_mango_login_with_reason(active_context, favorites_page)
+                if not re_ok:
+                    send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
+                    return "fatal"
+                current_url = (favorites_page.url or "").lower()
+
+            if "/tr/" not in current_url or not any(
+                k in current_url for k in ("favorites", "favori", "wishlist", "saved")
+            ):
+                print("[UYARI] Mango favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
+                try:
+                    await safe_goto(favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000, retries=2)
+                    await _wait_for_mango_favorites_ready(favorites_page, timeout_ms=12000)
+                except Exception as exc:
+                    print(f"[HATA] Mango favorilere dönülemedi: {exc}")
+                    return "reload_failed"
+                current_url = (favorites_page.url or "").lower()
+                if "login" in current_url or "signin" in current_url:
+                    print("[UYARI] Mango oturumu düştü, yeniden giriş deneniyor...")
+                    clear_session_valid_marker("mango")
+                    re_ok, re_reason = await _ensure_mango_login_with_reason(active_context, favorites_page)
+                    if not re_ok:
+                        send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
+                        return "fatal"
+
+            extracted = await _scroll_and_extract_mango_candidates(favorites_page)
+            total = extracted.get("total", 0)
+            candidates = extracted.get("items", [])
+
+            # Retry once on unexpected 0-item read to overcome slow SPA hydration over proxy.
+            if total == 0 and last_known_total > 0:
+                print(
+                    f"[UYARI] Mango 0 ürün gördü (önceki tur: {last_known_total}); "
+                    "SPA yüklenmesi için sayfa bir kez tazeleniyor..."
+                )
+                try:
+                    await safe_goto(favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000, retries=2)
+                    await _wait_for_mango_favorites_ready(favorites_page, timeout_ms=12000)
+                    extracted = await _scroll_and_extract_mango_candidates(favorites_page)
+                    total = extracted.get("total", 0)
+                    candidates = extracted.get("items", [])
+                except Exception as exc:
+                    print(f"[UYARI] Mango boş liste kurtarma denemesi başarısız: {exc}")
+
+            print(f"[Mango] Favorilerde toplam {total} ürün görüldü ({len(candidates)} stokta aday).")
+            if cycle == 1 and total == 0:
+                print(f"[Mango] İlk tur 0 ürün teşhisi -> {await page_diagnostics(favorites_page)}")
+                print(f"[Mango] İlk tur DOM teşhis -> {await _mango_dom_diagnostics(favorites_page)}")
+
+            if total == 0:
+                if await has_block_or_captcha(favorites_page):
+                    return "blocked"
+
+                loop_state = await _inspect_mango_page(favorites_page)
+                if (
+                    loop_state["has_login_url"]
+                    or loop_state["has_login_form"]
+                    or loop_state["has_login_cta_in_main"]
+                ):
+                    print(
+                        "[UYARI] Mango oturumu sayfa içinde düştü "
+                        "(login_cta/form algılandı), yeniden giriş deneniyor..."
+                    )
+                    clear_session_valid_marker("mango")
+                    re_ok, re_reason = await _ensure_mango_login_with_reason(active_context, favorites_page)
+                    if not re_ok:
+                        send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
+                        return "fatal"
+                    return "relogin_continue"
+
+                consecutive_empty_reads += 1
+                if last_known_total > 0 and consecutive_empty_reads < 2:
+                    print(
+                        "[UYARI] Mango geçici 0 ürün okudu; yanlış 'Stok Tükendi' bildirimini "
+                        "önlemek için bu turda bildirim ve oturum kaydı atlandı -> "
+                        f"{await page_diagnostics(favorites_page)}"
+                    )
+                    return "empty_retry"
+            else:
+                last_known_total = total
+                consecutive_empty_reads = 0
+
+            matched_items: list[dict] = []
+            errored_urls: set[str] = set()
+            errored_tabs = 0
+            if candidates:
+                results = await asyncio.gather(
+                    *[_open_and_check_tab(active_context, prod, sem) for prod in candidates],
+                    return_exceptions=True,
+                )
+                for prod, res in zip(candidates, results):
+                    if isinstance(res, Exception):
+                        errored_tabs += 1
+                        if prod.get("url"):
+                            errored_urls.add(prod["url"])
+                        print(f"  [HATA] Mango sekme istisnası: {res}")
+                    else:
+                        status, item = res
+                        if status == "match" and item is not None:
+                            matched_items.append(item)
+                        elif status == "error":
+                            errored_tabs += 1
+                            if prod.get("url"):
+                                errored_urls.add(prod["url"])
+
+            if candidates and errored_tabs == len(candidates):
+                print(
+                    "[UYARI] Mango tüm ürün sekmeleri hata verdi; yanlış 'Stok Tükendi' "
+                    "önlemek için bildirim değerlendirmesi atlandı."
+                )
+            else:
+                notifier.process_cycle(matched_items, uncertain_urls=errored_urls)
+
+            if total > 0 and (cycle == 1 or cycle % SESSION_SAVE_EVERY_CYCLES == 0):
+                await save_store_session(active_context, "mango", mark_valid=True)
+
+            return "ok"
 
         while (time.time() - start_time) < max_seconds:
             cycle += 1
             cycle_start = time.time()
             print(f"\n[MANGO — Tur #{cycle}] Favoriler yenileniyor...")
 
+            outcome = "ok"
             try:
-                needs_navigation = cycle > 1
-                if favorites_page.is_closed():
-                    print("[UYARI] Mango favoriler sekmesi kapanmış, yeniden açılıyor...")
-                    favorites_page = await context.new_page()
-                    needs_navigation = True
-                elif cycle > 1 and cycle % RECYCLE_TAB_EVERY_CYCLES == 0:
-                    print("[Mango] Bellek temizliği için favoriler sekmesi yenileniyor...")
-                    try:
-                        await favorites_page.close()
-                    except Exception:
-                        pass
-                    favorites_page = await context.new_page()
-                    needs_navigation = True
-
-                if needs_navigation:
-                    if not await safe_reload_or_goto(
-                        favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000
-                    ):
-                        consecutive_reload_failures += 1
-                        if consecutive_reload_failures % 3 == 0:
-                            print("[UYARI] Mango sekmesi yenileniyor (ardışık yükleme hatası)...")
-                            try:
-                                await favorites_page.close()
-                            except Exception:
-                                pass
-                            favorites_page = await context.new_page()
-                        if consecutive_reload_failures >= OUTAGE_ALERT_THRESHOLD and not outage_alert_sent:
-                            outage_alert_sent = True
-                            send_telegram_message(
-                                f"⚠️ Mango favoriler sayfasına arka arkaya {consecutive_reload_failures} kez "
-                                "erişilemedi (ev proxy/ağ kesintisi olabilir). Tekrar denenmeye devam ediliyor."
-                            )
-                        remaining = max_seconds - (time.time() - start_time)
-                        if remaining <= REFRESH_INTERVAL:
-                            break
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-
-                if consecutive_reload_failures > 0:
-                    if outage_alert_sent:
-                        print("[Mango] ✅ Bağlantı/proxy erişimi tekrar sağlandı.")
-                        outage_alert_sent = False
-                    consecutive_reload_failures = 0
-
-                wait_ms = 12000 if (cycle == 1 or last_known_total > 0) else 8000
-                ready_state = await _wait_for_mango_favorites_ready(favorites_page, timeout_ms=wait_ms)
-
-                if ready_state == "blocked" or await has_block_or_captcha(favorites_page):
-                    print(f"[UYARI] Mango geçici engeli algılandı, {ERROR_COOLDOWN} sn bekleniyor...")
-                    remaining = max_seconds - (time.time() - start_time)
-                    if remaining <= ERROR_COOLDOWN:
-                        break
-                    await asyncio.sleep(ERROR_COOLDOWN)
-                    continue
-
-                current_url = (favorites_page.url or "").lower()
-                if "login" in current_url or "signin" in current_url:
-                    print("[UYARI] Mango oturumu düştü, yeniden giriş deneniyor...")
+                outcome = await asyncio.wait_for(_execute_cycle(), timeout=CYCLE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                consecutive_loop_errors += 1
+                print(
+                    f"[HATA] Mango tur #{cycle} zaman aşımına uğradı (>{CYCLE_TIMEOUT_SECONDS} sn) "
+                    f"(ardışık: {consecutive_loop_errors}/{MAX_CONSECUTIVE_ERRORS}). "
+                    "Tarayıcı ve bağlam canlı yeniden başlatılıyor..."
+                )
+                if consecutive_loop_errors >= MAX_CONSECUTIVE_ERRORS:
                     clear_session_valid_marker("mango")
-                    re_ok, re_reason = await _ensure_mango_login_with_reason(context, favorites_page)
-                    if not re_ok:
-                        send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
-                        return False
-                    current_url = (favorites_page.url or "").lower()
-
-                if "/tr/" not in current_url or not any(
-                    k in current_url for k in ("favorites", "favori", "wishlist", "saved")
-                ):
-                    print("[UYARI] Mango favori sayfası dışına çıkıldığı algılandı, favorilere dönülüyor...")
-                    try:
-                        await safe_goto(favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000, retries=2)
-                        await _wait_for_mango_favorites_ready(favorites_page, timeout_ms=12000)
-                    except Exception as exc:
-                        print(f"[HATA] Mango favorilere dönülemedi: {exc}")
-                        remaining = max_seconds - (time.time() - start_time)
-                        if remaining <= REFRESH_INTERVAL:
-                            break
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-                    current_url = (favorites_page.url or "").lower()
-                    if "login" in current_url or "signin" in current_url:
-                        print("[UYARI] Mango oturumu düştü, yeniden giriş deneniyor...")
-                        clear_session_valid_marker("mango")
-                        re_ok, re_reason = await _ensure_mango_login_with_reason(context, favorites_page)
-                        if not re_ok:
-                            send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
-                            return False
-
-                extracted = await _scroll_and_extract_mango_candidates(favorites_page)
-                total = extracted.get("total", 0)
-                candidates = extracted.get("items", [])
-
-                # Retry once on unexpected 0-item read to overcome slow SPA hydration over proxy.
-                if total == 0 and last_known_total > 0:
-                    print(
-                        f"[UYARI] Mango 0 ürün gördü (önceki tur: {last_known_total}); "
-                        "SPA yüklenmesi için sayfa bir kez tazeleniyor..."
+                    send_telegram_message(
+                        "🚨 Mango takip botu ardışık zaman aşımı nedeniyle durdu (proxy veya tarayıcı yanıt vermiyor)."
                     )
-                    try:
-                        await safe_goto(favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000, retries=2)
-                        await _wait_for_mango_favorites_ready(favorites_page, timeout_ms=12000)
-                        extracted = await _scroll_and_extract_mango_candidates(favorites_page)
-                        total = extracted.get("total", 0)
-                        candidates = extracted.get("items", [])
-                    except Exception as exc:
-                        print(f"[UYARI] Mango boş liste kurtarma denemesi başarısız: {exc}")
-
-                print(f"[Mango] Favorilerde toplam {total} ürün görüldü ({len(candidates)} stokta aday).")
-                if cycle == 1 and total == 0:
-                    print(f"[Mango] İlk tur 0 ürün teşhisi -> {await page_diagnostics(favorites_page)}")
-                    print(f"[Mango] İlk tur DOM teşhis -> {await _mango_dom_diagnostics(favorites_page)}")
-
-                if total == 0:
-                    if await has_block_or_captcha(favorites_page):
-                        print(f"[UYARI] Mango boş sayfada geçici engel algılandı, {ERROR_COOLDOWN} sn bekleniyor...")
-                        remaining = max_seconds - (time.time() - start_time)
-                        if remaining <= ERROR_COOLDOWN:
-                            break
-                        await asyncio.sleep(ERROR_COOLDOWN)
-                        continue
-
-                    loop_state = await _inspect_mango_page(favorites_page)
-                    if (
-                        loop_state["has_login_url"]
-                        or loop_state["has_login_form"]
-                        or loop_state["has_login_cta_in_main"]
-                    ):
-                        print(
-                            "[UYARI] Mango oturumu sayfa içinde düştü "
-                            "(login_cta/form algılandı), yeniden giriş deneniyor..."
-                        )
-                        clear_session_valid_marker("mango")
-                        re_ok, re_reason = await _ensure_mango_login_with_reason(context, favorites_page)
-                        if not re_ok:
-                            send_telegram_message(_format_login_failure_alert(re_reason, mid_run=True))
-                            return False
-                        continue
-
-                    consecutive_empty_reads += 1
-                    if last_known_total > 0 and consecutive_empty_reads < 2:
-                        print(
-                            "[UYARI] Mango geçici 0 ürün okudu; yanlış 'Stok Tükendi' bildirimini "
-                            "önlemek için bu turda bildirim ve oturum kaydı atlandı -> "
-                            f"{await page_diagnostics(favorites_page)}"
-                        )
-                        remaining = max_seconds - (time.time() - start_time)
-                        if remaining <= REFRESH_INTERVAL:
-                            break
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-                else:
-                    last_known_total = total
-                    consecutive_empty_reads = 0
-
-                matched_items: list[dict] = []
-                errored_urls: set[str] = set()
-                errored_tabs = 0
-                if candidates:
-                    results = await asyncio.gather(
-                        *[_open_and_check_tab(context, prod, sem) for prod in candidates],
-                        return_exceptions=True,
-                    )
-                    for prod, res in zip(candidates, results):
-                        if isinstance(res, Exception):
-                            errored_tabs += 1
-                            if prod.get("url"):
-                                errored_urls.add(prod["url"])
-                            print(f"  [HATA] Mango sekme istisnası: {res}")
-                        else:
-                            status, item = res
-                            if status == "match" and item is not None:
-                                matched_items.append(item)
-                            elif status == "error":
-                                errored_tabs += 1
-                                if prod.get("url"):
-                                    errored_urls.add(prod["url"])
-
-                if candidates and errored_tabs == len(candidates):
-                    print(
-                        "[UYARI] Mango tüm ürün sekmeleri hata verdi; yanlış 'Stok Tükendi' "
-                        "önlemek için bildirim değerlendirmesi atlandı."
-                    )
-                else:
-                    notifier.process_cycle(matched_items, uncertain_urls=errored_urls)
-
-                if total > 0 and (cycle == 1 or cycle % SESSION_SAVE_EVERY_CYCLES == 0):
-                    await save_store_session(context, "mango", mark_valid=True)
-
-                consecutive_loop_errors = 0
+                    return False
+                try:
+                    await _restart_browser_and_page()
+                except Exception as restart_exc:
+                    print(f"[HATA] Mango canlı tarayıcı yeniden başlatma başarısız: {restart_exc}")
+                retry_wait = min(5.0, float(REFRESH_INTERVAL))
+                remaining = max_seconds - (time.time() - start_time)
+                if remaining <= retry_wait:
+                    break
+                await asyncio.sleep(retry_wait)
+                continue
             except Exception as exc:
                 consecutive_loop_errors += 1
-                print(f"[HATA] Mango tur #{cycle} beklenmeyen hata ({consecutive_loop_errors}): {exc}")
-                if consecutive_loop_errors >= 3:
+                print(
+                    f"[HATA] Mango tur #{cycle} beklenmeyen hata "
+                    f"(ardışık: {consecutive_loop_errors}/{MAX_CONSECUTIVE_ERRORS}): {exc}"
+                )
+                if consecutive_loop_errors >= MAX_CONSECUTIVE_ERRORS:
+                    clear_session_valid_marker("mango")
+                    send_telegram_message(
+                        "🚨 Mango takip botu ardışık hatalar nedeniyle durdu (proxy veya tarayıcı hatası)."
+                    )
+                    return False
+                if is_target_closed_error(exc) or (
+                    consecutive_loop_errors % BROWSER_RESTART_ERROR_THRESHOLD == 0
+                ):
                     try:
-                        if not favorites_page.is_closed():
-                            await favorites_page.close()
-                    except Exception:
-                        pass
-                    try:
-                        favorites_page = await context.new_page()
-                    except Exception:
-                        pass
+                        await _restart_browser_and_page()
+                    except Exception as restart_exc:
+                        print(f"[HATA] Mango canlı tarayıcı yeniden başlatma başarısız: {restart_exc}")
+                remaining = max_seconds - (time.time() - start_time)
+                if remaining <= REFRESH_INTERVAL:
+                    break
+                await asyncio.sleep(REFRESH_INTERVAL)
+                continue
             finally:
-                await _close_stray_tabs(context, favorites_page)
+                await _close_stray_tabs(active_context, favorites_page)
+
+            if outcome == "fatal":
+                clear_session_valid_marker("mango")
+                return False
+
+            if outcome in ("reload_failed", "reverify_network_error"):
+                consecutive_reload_failures += 1
+                consecutive_loop_errors += 1
+                if consecutive_reload_failures >= OUTAGE_ALERT_THRESHOLD and not outage_alert_sent:
+                    outage_alert_sent = True
+                    send_telegram_message(
+                        f"⚠️ Mango favoriler sayfasına arka arkaya {consecutive_reload_failures} kez "
+                        "erişilemedi (ev proxy/ağ kesintisi olabilir). Tekrar denenmeye devam ediliyor."
+                    )
+                if (
+                    consecutive_reload_failures >= MAX_CONSECUTIVE_ERRORS
+                    or consecutive_loop_errors >= MAX_CONSECUTIVE_ERRORS
+                ):
+                    clear_session_valid_marker("mango")
+                    send_telegram_message(
+                        "🚨 Mango takip botu ardışık bağlantı/proxy hataları nedeniyle durdu."
+                    )
+                    return False
+                if consecutive_reload_failures % BROWSER_RESTART_ERROR_THRESHOLD == 0:
+                    print("[UYARI] Mango ardışık bağlantı hatası; tarayıcı ve bağlam canlı yeniden başlatılıyor...")
+                    try:
+                        await _restart_browser_and_page()
+                    except Exception as restart_exc:
+                        print(f"[HATA] Mango canlı tarayıcı yeniden başlatma başarısız: {restart_exc}")
+                remaining = max_seconds - (time.time() - start_time)
+                if remaining <= REFRESH_INTERVAL:
+                    break
+                await asyncio.sleep(REFRESH_INTERVAL)
+                continue
+
+            if outcome == "blocked":
+                consecutive_block_errors += 1
+                print(
+                    f"[UYARI] Mango geçici engeli algılandı "
+                    f"({consecutive_block_errors}/{MAX_CONSECUTIVE_ERRORS}), {ERROR_COOLDOWN} sn bekleniyor..."
+                )
+                if consecutive_block_errors >= MAX_CONSECUTIVE_ERRORS:
+                    clear_session_valid_marker("mango")
+                    send_telegram_message(
+                        "🚨 Mango takip botunda sürekli WAF/CAPTCHA engeli algılandı; çalışma durduruldu."
+                    )
+                    return False
+                remaining = max_seconds - (time.time() - start_time)
+                if remaining <= ERROR_COOLDOWN:
+                    break
+                await asyncio.sleep(ERROR_COOLDOWN)
+                continue
+
+            consecutive_loop_errors = 0
+            consecutive_block_errors = 0
+
+            if outcome == "relogin_continue":
+                consecutive_reload_failures = 0
+                continue
+
+            if outcome == "empty_retry":
+                remaining = max_seconds - (time.time() - start_time)
+                if remaining <= REFRESH_INTERVAL:
+                    break
+                await asyncio.sleep(REFRESH_INTERVAL)
+                continue
 
             cycle_elapsed = time.time() - cycle_start
-            min_sleep = min(10.0, float(REFRESH_INTERVAL))
-            sleep_for = max(min_sleep, float(REFRESH_INTERVAL) - cycle_elapsed)
+            sleep_for = compute_cycle_sleep(cycle_elapsed, REFRESH_INTERVAL, min_gap=3.0)
             remaining = max_seconds - (time.time() - start_time)
             if remaining <= sleep_for:
                 break
@@ -1033,17 +1155,35 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
             )
             await asyncio.sleep(sleep_for)
 
-        if consecutive_reload_failures >= OUTAGE_ALERT_THRESHOLD:
+        if (
+            consecutive_reload_failures >= OUTAGE_ALERT_THRESHOLD
+            or consecutive_loop_errors >= MAX_CONSECUTIVE_ERRORS
+            or consecutive_block_errors >= MAX_CONSECUTIVE_ERRORS
+        ):
+            clear_session_valid_marker("mango")
             print(
                 f"[HATA] Mango koşusu kesintisiz bağlantı/proxy arızası "
-                f"({consecutive_reload_failures} ardışık hata) ile sona erdi."
+                f"(reload={consecutive_reload_failures}, hata={consecutive_loop_errors}, "
+                f"engel={consecutive_block_errors}) ile sona erdi."
             )
             return False
+
+        if active_context is not original_context:
+            try:
+                await asyncio.wait_for(
+                    save_store_session(active_context, "mango", mark_valid=True),
+                    timeout=15.0,
+                )
+            except Exception as exc:
+                print(f"[UYARI] Mango yenilenen bağlam oturumu kaydedilemedi: {exc}")
 
         return True
     finally:
         try:
             if not favorites_page.is_closed():
-                await favorites_page.close()
+                await asyncio.wait_for(favorites_page.close(), timeout=5.0)
         except Exception:
             pass
+        if active_context is not original_context:
+            await close_browser_safely(context=active_context, browser=active_browser)
+            await cleanup_owned_playwright("mango")

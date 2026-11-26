@@ -10,11 +10,15 @@ from contextlib import redirect_stdout
 from unittest.mock import AsyncMock, patch
 
 from config import SCRIPT_DIR
+import core.browser as core_browser
 from core.browser import (
     _load_valid_storage_state,
     _mask_proxy_server,
+    compute_cycle_sleep,
     get_proxy_config,
+    is_target_closed_error,
     launch_store_browser,
+    relaunch_store_browser,
 )
 from core.notifier import StockWaveNotifier, _split_message
 from core.session import (
@@ -25,7 +29,9 @@ from core.session import (
 )
 from export_session import _verify_favorites_page
 from main_bot import _run_store
+import mango.mango_bot as mango_bot
 from mango.mango_bot import _has_mango_api_auth_failure, _norm_fold as mango_norm
+import oxxo.oxxo_bot as oxxo_bot
 from oxxo.oxxo_bot import _norm_fold as oxxo_norm
 from zara.zara_bot import _ZaraNetworkMonitor, _normalize_tr_lower
 
@@ -202,6 +208,70 @@ class TestCoreBrowser(unittest.TestCase):
                     "password": "supersecret",
                 },
             )
+
+        asyncio.run(run())
+
+    def test_dead_block_heavy_resources_removed_and_sleep_cadence_helpers(self):
+        self.assertFalse(hasattr(core_browser, "_block_heavy_resources"))
+        # REFRESH_INTERVAL=30s target with 3s safety floor
+        self.assertAlmostEqual(compute_cycle_sleep(0.0, 30.0), 30.0)
+        self.assertAlmostEqual(compute_cycle_sleep(15.0, 30.0), 15.0)
+        self.assertAlmostEqual(compute_cycle_sleep(22.0, 30.0), 8.0)
+        self.assertAlmostEqual(compute_cycle_sleep(27.0, 30.0), 3.0)
+        self.assertAlmostEqual(compute_cycle_sleep(35.0, 30.0), 3.0)
+        self.assertAlmostEqual(compute_cycle_sleep(1.0, 2.0), 2.0)
+
+        self.assertTrue(
+            is_target_closed_error(RuntimeError("Target page, context or browser has been closed"))
+        )
+        self.assertTrue(is_target_closed_error(RuntimeError("Browser has been closed")))
+        self.assertFalse(is_target_closed_error(RuntimeError("net::ERR_TIMED_OUT")))
+
+    def test_relaunch_store_browser_closes_old_and_reuses_playwright(self):
+        class FakeContext:
+            def __init__(self, browser):
+                self.browser = browser
+                self.close = AsyncMock()
+
+        class FakeBrowser:
+            def __init__(self, idx):
+                self.idx = idx
+                self.close = AsyncMock()
+                self.context = FakeContext(self)
+
+            async def new_context(self, **kwargs):
+                return self.context
+
+        class FakeChromium:
+            def __init__(self):
+                self.browsers = []
+
+            async def launch(self, **kwargs):
+                br = FakeBrowser(len(self.browsers) + 1)
+                self.browsers.append(br)
+                return br
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+
+        async def run():
+            pw = FakePlaywright()
+            store = "_unit_relaunch_store"
+            try:
+                with patch("core.browser.get_proxy_config", return_value=None), patch(
+                    "core.browser._load_valid_storage_state", return_value=None
+                ):
+                    br1, ctx1 = await launch_store_browser(pw, store)
+                    br2, ctx2 = await relaunch_store_browser(store, old_context=ctx1, old_browser=br1)
+                self.assertEqual(len(pw.chromium.browsers), 2)
+                self.assertIsNot(br1, br2)
+                self.assertIsNot(ctx1, ctx2)
+                ctx1.close.assert_awaited_once()
+                br1.close.assert_awaited_once()
+            finally:
+                core_browser._ACTIVE_PLAYWRIGHT_BY_STORE.pop(store, None)
+                core_browser._OWNED_PLAYWRIGHT_BY_STORE.pop(store, None)
 
         asyncio.run(run())
 
@@ -604,6 +674,14 @@ class TestWorkflowChainingLogic(unittest.TestCase):
           const w3 = await runWatchdog(longPartialRuns, {{}});
           assert.strictEqual(w3.length, 1, "5.5h partial failures must not trip circuit breaker");
 
+          // 6) Active single-store 'Manuel Test' run must NOT block Watchdog from recovering 7/24 chain!
+          const activeManualPlusOld = [
+            {{ id: 30, status: "in_progress", display_title: "Manuel Test (zara, 1dk)" }},
+            mkRun(29, 20100, "success"),
+          ];
+          const w4 = await runWatchdog(activeManualPlusOld, {{}});
+          assert.strictEqual(w4.length, 1, "Active manual test run must not suppress 7/24 watchdog recovery");
+
           console.log("ALL_WORKFLOW_SIMULATIONS_OK");
         }})().catch((e) => {{
           console.error(e);
@@ -682,6 +760,354 @@ class TestStoreLogic(unittest.TestCase):
             mon.stop()
 
         asyncio.run(run())
+
+    def test_zara_password_switch_selectors_and_30s_cadence(self):
+        import zara.zara_bot as zara_bot
+
+        joined = " ".join(zara_bot.PASSWORD_SWITCH_SELECTORS).lower()
+        self.assertIn("şifre ile giriş yap", joined)
+        self.assertIn("sign in with password", joined)
+        self.assertAlmostEqual(zara_bot._compute_cycle_sleep(22.0), 8.0)
+        self.assertAlmostEqual(zara_bot._compute_cycle_sleep(29.0), 3.0)
+        self.assertEqual(zara_bot.CYCLE_TIMEOUT_SECONDS, 180)
+
+
+class _FakePage:
+    def __init__(self, url: str):
+        self.url = url
+        self._closed = False
+        self.close = AsyncMock(side_effect=self._mark_closed)
+        self.wait_for_timeout = AsyncMock()
+
+    def _mark_closed(self):
+        self._closed = True
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+
+class _FakeContext:
+    def __init__(self, url: str, browser=None):
+        self.url = url
+        self.browser = browser
+        self.pages: list[_FakePage] = []
+        self.close = AsyncMock()
+
+    async def new_page(self) -> _FakePage:
+        page = _FakePage(self.url)
+        self.pages.append(page)
+        return page
+
+
+class _FakeBrowser:
+    def __init__(self):
+        self.close = AsyncMock()
+
+
+class TestStoreRecoveryAndResilience(unittest.TestCase):
+    def test_mango_loop_recovers_from_cycle_timeout_by_restarting_browser(self):
+        clear_session_valid_marker("mango")
+        br1, br2 = _FakeBrowser(), _FakeBrowser()
+        ctx1 = _FakeContext("https://shop.mango.com/tr/tr/favorites", browser=br1)
+        ctx2 = _FakeContext("https://shop.mango.com/tr/tr/favorites", browser=br2)
+        state = {"scroll_calls": 0, "restarts": 0, "now": 1000.0}
+
+        def fake_time():
+            return state["now"]
+
+        async def fake_sleep(sec):
+            state["now"] += max(sec, 10.0)
+
+        async def fake_scroll(page):
+            state["scroll_calls"] += 1
+            if state["scroll_calls"] == 1:
+                await asyncio.Event().wait()  # truly hangs until CYCLE_TIMEOUT_SECONDS cancels it
+            state["now"] += 70.0  # finishes 1-min run cleanly after recovery cycle
+            return {"total": 1, "items": []}
+
+        async def fake_relaunch(store, old_context=None, old_browser=None, playwright=None):
+            state["restarts"] += 1
+            return br2, ctx2
+
+        async def run():
+            with patch.object(mango_bot, "CYCLE_TIMEOUT_SECONDS", 0.05), patch.object(
+                mango_bot, "REFRESH_INTERVAL", 30
+            ), patch.object(mango_bot.time, "time", side_effect=fake_time), patch.object(
+                mango_bot.asyncio, "sleep", side_effect=fake_sleep
+            ), patch.object(
+                mango_bot, "_ensure_mango_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                mango_bot, "_wait_for_mango_favorites_ready", new=AsyncMock(return_value="products")
+            ), patch.object(
+                mango_bot, "has_block_or_captcha", new=AsyncMock(return_value=False)
+            ), patch.object(
+                mango_bot, "_scroll_and_extract_mango_candidates", side_effect=fake_scroll
+            ), patch.object(
+                mango_bot, "relaunch_store_browser", side_effect=fake_relaunch
+            ), patch.object(
+                mango_bot, "save_store_session", new=AsyncMock(return_value=True)
+            ) as save_mock, patch.object(
+                mango_bot, "send_telegram_message"
+            ) as tg_mock:
+                ok = await mango_bot.run_mango_loop(ctx1, max_run_minutes=1)
+                return ok, save_mock, tg_mock
+
+        try:
+            ok, save_mock, tg_mock = asyncio.run(run())
+            self.assertTrue(ok)
+            self.assertEqual(state["restarts"], 1)
+            self.assertEqual(state["scroll_calls"], 2)
+            tg_mock.assert_not_called()
+            # Final session saved on restarted context ctx2 and restarted browser closed
+            self.assertTrue(any(call.args[0] is ctx2 for call in save_mock.await_args_list))
+            ctx2.close.assert_awaited()
+            br2.close.assert_awaited()
+        finally:
+            clear_session_valid_marker("mango")
+
+    def test_mango_loop_restarts_after_3_reload_failures_and_recovers(self):
+        clear_session_valid_marker("mango")
+        br1, br2 = _FakeBrowser(), _FakeBrowser()
+        ctx1 = _FakeContext("https://shop.mango.com/tr/tr/favorites", browser=br1)
+        ctx2 = _FakeContext("https://shop.mango.com/tr/tr/favorites", browser=br2)
+        state = {"reloads": 0, "restarts": 0, "scrolls": 0, "now": 1000.0}
+
+        async def fake_sleep(sec):
+            state["now"] += 1.0
+
+        async def fake_reload(page, url, timeout_ms=30000):
+            state["reloads"] += 1
+            return False
+
+        async def fake_scroll(page):
+            state["scrolls"] += 1
+            if state["scrolls"] >= 2:
+                state["now"] += 120.0
+            return {"total": 1, "items": []}
+
+        async def fake_relaunch(store, old_context=None, old_browser=None, playwright=None):
+            state["restarts"] += 1
+            return br2, ctx2
+
+        async def run():
+            with patch.object(mango_bot, "REFRESH_INTERVAL", 30), patch.object(
+                mango_bot.time, "time", side_effect=lambda: state["now"]
+            ), patch.object(mango_bot.asyncio, "sleep", side_effect=fake_sleep), patch.object(
+                mango_bot, "_ensure_mango_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                mango_bot, "safe_reload_or_goto", side_effect=fake_reload
+            ), patch.object(
+                mango_bot, "_wait_for_mango_favorites_ready", new=AsyncMock(return_value="products")
+            ), patch.object(
+                mango_bot, "has_block_or_captcha", new=AsyncMock(return_value=False)
+            ), patch.object(
+                mango_bot, "_scroll_and_extract_mango_candidates", side_effect=fake_scroll
+            ), patch.object(
+                mango_bot, "relaunch_store_browser", side_effect=fake_relaunch
+            ), patch.object(
+                mango_bot, "save_store_session", new=AsyncMock(return_value=True)
+            ):
+                return await mango_bot.run_mango_loop(ctx1, max_run_minutes=1)
+
+        try:
+            ok = asyncio.run(run())
+            self.assertTrue(ok)
+            self.assertEqual(state["reloads"], 3)
+            self.assertEqual(state["restarts"], 1)
+            self.assertEqual(state["scrolls"], 2)
+        finally:
+            clear_session_valid_marker("mango")
+
+    def test_mango_loop_returns_false_and_alerts_on_max_errors_and_blocks(self):
+        # 1) Unexpected loop errors reaching MAX_CONSECUTIVE_ERRORS
+        mark_session_valid("mango")
+        ctx = _FakeContext("https://shop.mango.com/tr/tr/favorites", browser=_FakeBrowser())
+
+        async def run_err():
+            with patch.object(mango_bot, "MAX_CONSECUTIVE_ERRORS", 3), patch.object(
+                mango_bot, "REFRESH_INTERVAL", 1
+            ), patch.object(mango_bot.asyncio, "sleep", new=AsyncMock()), patch.object(
+                mango_bot, "_ensure_mango_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                mango_bot, "safe_reload_or_goto", new=AsyncMock(return_value=True)
+            ), patch.object(
+                mango_bot, "_wait_for_mango_favorites_ready", new=AsyncMock(side_effect=RuntimeError("boom"))
+            ), patch.object(
+                mango_bot, "send_telegram_message"
+            ) as tg_mock:
+                ok = await mango_bot.run_mango_loop(ctx, max_run_minutes=10)
+                return ok, tg_mock
+
+        try:
+            ok, tg_mock = asyncio.run(run_err())
+            self.assertFalse(ok)
+            self.assertFalse(has_valid_session_marker("mango"))
+            tg_mock.assert_called_once()
+        finally:
+            clear_session_valid_marker("mango")
+
+        # 2) Persistent mid-run WAF/CAPTCHA blocks reaching MAX_CONSECUTIVE_ERRORS
+        mark_session_valid("mango")
+        ctx_b = _FakeContext("https://shop.mango.com/tr/tr/favorites", browser=_FakeBrowser())
+
+        async def run_block():
+            with patch.object(mango_bot, "MAX_CONSECUTIVE_ERRORS", 3), patch.object(
+                mango_bot, "ERROR_COOLDOWN", 1
+            ), patch.object(mango_bot.asyncio, "sleep", new=AsyncMock()), patch.object(
+                mango_bot, "_ensure_mango_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                mango_bot, "safe_reload_or_goto", new=AsyncMock(return_value=True)
+            ), patch.object(
+                mango_bot, "_wait_for_mango_favorites_ready", new=AsyncMock(return_value="blocked")
+            ), patch.object(
+                mango_bot, "has_block_or_captcha", new=AsyncMock(return_value=True)
+            ), patch.object(
+                mango_bot, "send_telegram_message"
+            ) as tg_mock:
+                ok = await mango_bot.run_mango_loop(ctx_b, max_run_minutes=10)
+                return ok, tg_mock
+
+        try:
+            ok, tg_mock = asyncio.run(run_block())
+            self.assertFalse(ok)
+            self.assertFalse(has_valid_session_marker("mango"))
+            tg_mock.assert_called_once()
+            self.assertIn("WAF/CAPTCHA", tg_mock.call_args.args[0])
+        finally:
+            clear_session_valid_marker("mango")
+
+    def test_oxxo_loop_recovers_from_cycle_timeout_and_enforces_error_limits(self):
+        clear_session_valid_marker("oxxo")
+        br1, br2 = _FakeBrowser(), _FakeBrowser()
+        ctx1 = _FakeContext("https://www.oxxo.com.tr/tr/p/User/FollowList", browser=br1)
+        ctx2 = _FakeContext("https://www.oxxo.com.tr/tr/p/User/FollowList", browser=br2)
+        state = {"extracts": 0, "restarts": 0, "now": 2000.0}
+
+        async def fake_sleep(sec):
+            state["now"] += max(sec, 10.0)
+
+        async def fake_extract(page):
+            state["extracts"] += 1
+            if state["extracts"] == 1:
+                await asyncio.Event().wait()  # truly hangs until CYCLE_TIMEOUT_SECONDS cancels it
+            state["now"] += 70.0
+            return []
+
+        async def fake_relaunch(store, old_context=None, old_browser=None, playwright=None):
+            state["restarts"] += 1
+            return br2, ctx2
+
+        async def run_timeout_recovery():
+            with patch.object(oxxo_bot, "CYCLE_TIMEOUT_SECONDS", 0.05), patch.object(
+                oxxo_bot, "REFRESH_INTERVAL", 30
+            ), patch.object(oxxo_bot.time, "time", side_effect=lambda: state["now"]), patch.object(
+                oxxo_bot.asyncio, "sleep", side_effect=fake_sleep
+            ), patch.object(
+                oxxo_bot, "_ensure_oxxo_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                oxxo_bot, "handle_cookies", new=AsyncMock()
+            ), patch.object(
+                oxxo_bot, "has_block_or_captcha", new=AsyncMock(return_value=False)
+            ), patch.object(
+                oxxo_bot,
+                "_inspect_oxxo_page",
+                new=AsyncMock(
+                    return_value={
+                        "is_followlist_url": True,
+                        "has_login_url": False,
+                        "has_login_form": False,
+                    }
+                ),
+            ), patch.object(
+                oxxo_bot, "scroll_page_to_bottom", new=AsyncMock()
+            ), patch.object(
+                oxxo_bot, "_extract_oxxo_candidates", side_effect=fake_extract
+            ), patch.object(
+                oxxo_bot, "relaunch_store_browser", side_effect=fake_relaunch
+            ), patch.object(
+                oxxo_bot, "save_store_session", new=AsyncMock(return_value=True)
+            ) as save_mock, patch.object(
+                oxxo_bot, "send_telegram_message"
+            ) as tg_mock:
+                ok = await oxxo_bot.run_oxxo_loop(ctx1, max_run_minutes=1)
+                return ok, save_mock, tg_mock
+
+        try:
+            ok, save_mock, tg_mock = asyncio.run(run_timeout_recovery())
+            self.assertTrue(ok)
+            self.assertEqual(state["restarts"], 1)
+            self.assertEqual(state["extracts"], 2)
+            tg_mock.assert_not_called()
+            self.assertTrue(any(call.args[0] is ctx2 for call in save_mock.await_args_list))
+            ctx2.close.assert_awaited()
+            br2.close.assert_awaited()
+        finally:
+            clear_session_valid_marker("oxxo")
+
+        # TargetClosedError triggers immediate browser restart and MAX_CONSECUTIVE_ERRORS aborts cleanly
+        mark_session_valid("oxxo")
+        ctx_err = _FakeContext("https://www.oxxo.com.tr/tr/p/User/FollowList", browser=_FakeBrowser())
+        err_restarts = {"count": 0}
+
+        async def fake_relaunch_err(store, old_context=None, old_browser=None, playwright=None):
+            err_restarts["count"] += 1
+            return _FakeBrowser(), _FakeContext(
+                "https://www.oxxo.com.tr/tr/p/User/FollowList", browser=_FakeBrowser()
+            )
+
+        async def run_target_closed():
+            with patch.object(oxxo_bot, "MAX_CONSECUTIVE_ERRORS", 3), patch.object(
+                oxxo_bot, "REFRESH_INTERVAL", 1
+            ), patch.object(oxxo_bot.asyncio, "sleep", new=AsyncMock()), patch.object(
+                oxxo_bot, "_ensure_oxxo_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                oxxo_bot, "handle_cookies", new=AsyncMock(side_effect=RuntimeError("Target page, context or browser has been closed"))
+            ), patch.object(
+                oxxo_bot, "relaunch_store_browser", side_effect=fake_relaunch_err
+            ), patch.object(
+                oxxo_bot, "send_telegram_message"
+            ) as tg_mock:
+                ok = await oxxo_bot.run_oxxo_loop(ctx_err, max_run_minutes=10)
+                return ok, tg_mock
+
+        try:
+            ok, tg_mock = asyncio.run(run_target_closed())
+            self.assertFalse(ok)
+            self.assertFalse(has_valid_session_marker("oxxo"))
+            self.assertGreaterEqual(err_restarts["count"], 1)
+            tg_mock.assert_called_once()
+        finally:
+            clear_session_valid_marker("oxxo")
+
+        # Persistent WAF/CAPTCHA block on Oxxo also stops at MAX_CONSECUTIVE_ERRORS
+        mark_session_valid("oxxo")
+        ctx_blk = _FakeContext("https://www.oxxo.com.tr/tr/p/User/FollowList", browser=_FakeBrowser())
+
+        async def run_oxxo_block():
+            with patch.object(oxxo_bot, "MAX_CONSECUTIVE_ERRORS", 3), patch.object(
+                oxxo_bot, "ERROR_COOLDOWN", 1
+            ), patch.object(oxxo_bot.asyncio, "sleep", new=AsyncMock()), patch.object(
+                oxxo_bot, "_ensure_oxxo_login_with_reason", new=AsyncMock(return_value=(True, "ok"))
+            ), patch.object(
+                oxxo_bot, "safe_reload_or_goto", new=AsyncMock(return_value=True)
+            ), patch.object(
+                oxxo_bot, "handle_cookies", new=AsyncMock()
+            ), patch.object(
+                oxxo_bot, "has_block_or_captcha", new=AsyncMock(return_value=True)
+            ), patch.object(
+                oxxo_bot, "send_telegram_message"
+            ) as tg_mock:
+                ok = await oxxo_bot.run_oxxo_loop(ctx_blk, max_run_minutes=10)
+                return ok, tg_mock
+
+        try:
+            ok, tg_mock = asyncio.run(run_oxxo_block())
+            self.assertFalse(ok)
+            self.assertFalse(has_valid_session_marker("oxxo"))
+            tg_mock.assert_called_once()
+            self.assertIn("WAF/CAPTCHA", tg_mock.call_args.args[0])
+        finally:
+            clear_session_valid_marker("oxxo")
 
 
 if __name__ == "__main__":

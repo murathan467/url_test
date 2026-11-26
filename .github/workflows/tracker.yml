@@ -1,4 +1,5 @@
 name: Zara, Mango & Oxxo Takip Botu
+run-name: ${{ (inputs.stores == '' || inputs.stores == 'all') && inputs.max_run_minutes == '' && format('7/24 Takip Zinciri (Tur #{0})', inputs.chain_depth || '1') || format('Manuel Test ({0}{1})', inputs.stores || 'all', inputs.max_run_minutes != '' && format(', {0}dk', inputs.max_run_minutes) || '') }}
 
 on:
   workflow_dispatch:
@@ -303,12 +304,18 @@ jobs:
               per_page: 15,
             });
 
+            const isManualTestRun = (r) =>
+              (r.display_title || r.name || "").startsWith("Manuel Test");
+
             const existing = runsData.workflow_runs.find(
-              (r) => r.id !== context.runId && activeStatuses.has(r.status)
+              (r) =>
+                r.id !== context.runId &&
+                activeStatuses.has(r.status) &&
+                !isManualTestRun(r)
             );
             if (existing) {
               console.log(
-                `Zaten aktif/sirada bir tracker.yml kosusu var (id=${existing.id}, status=${existing.status}); yeni tetikleme atlandi.`
+                `Zaten aktif/sirada bir 7/24 tracker.yml kosusu var (id=${existing.id}, status=${existing.status}); yeni tetikleme atlandi.`
               );
               return;
             }
