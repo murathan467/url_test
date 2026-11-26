@@ -40,33 +40,52 @@ jobs:
               return;
             }
 
-            // --- Ardisik fail koruması ---
+            // --- Ardisik kisa/tam cokme korumasi ---
+            // Not: OXXO/Mango 5.5 saat calisip tek bir magaza fail oldugunda workflow 'failure'
+            // gorunse bile gercek bir sonsuz fail dongusu degildir; yalnizca <10 dk icinde
+            // ust uste 3 kez tam coken kosularda devre kesici tetiklenir.
             const completedRuns = runsData.workflow_runs
               .filter((r) => r.status === "completed")
               .slice(0, 3);
 
-            const allFailed = completedRuns.length >= 3 &&
-              completedRuns.every((r) => r.conclusion === "failure");
+            const isShortFailure = (r) => {
+              if (r.conclusion !== "failure") return false;
+              const startMs = new Date(r.run_started_at || r.created_at).getTime();
+              const endMs = new Date(r.updated_at || r.created_at).getTime();
+              const durSec = Math.max(0, Math.round((endMs - startMs) / 1000));
+              return durSec < 600;
+            };
 
-            if (allFailed) {
+            const allShortFailed = completedRuns.length >= 3 &&
+              completedRuns.every(isShortFailure);
+
+            if (allShortFailed) {
               console.log(
-                "Son 3 tracker.yml calismasi ust uste basarisiz. " +
+                "Son 3 tracker.yml calismasi 10 dk altinda ust uste basarisiz. " +
                 "Sonsuz fail dongusu onleniyor; yeni tetikleme ATLANDI."
               );
 
-              // Telegram uyarisi gonder (tek seferlik)
+              // Telegram uyarisini yalnizca son fail tazeyse (son 35 dk icinde) gonder;
+              // her 30 dk'lik cron turunda tekrar spam atilmasini onle.
+              const lastFailMs = completedRuns[0]
+                ? new Date(completedRuns[0].updated_at || completedRuns[0].created_at).getTime()
+                : 0;
+              const minsSinceLastFail = lastFailMs
+                ? (Date.now() - lastFailMs) / 60000
+                : 999;
+
               const token = process.env.TELEGRAM_TOKEN || "";
               const chatId = process.env.TELEGRAM_CHAT_ID || "";
-              if (token && chatId) {
+              if (token && chatId && minsSinceLastFail <= 35) {
                 const lastFailTime = completedRuns[0]
                   ? completedRuns[0].updated_at
                   : "?";
                 const msg =
                   "⚠️ <b>GizIndirimBot Watchdog Uyarisi</b>\n\n" +
-                  "Son 3 tracker.yml calismasi ust uste <b>basarisiz</b> oldu.\n" +
+                  "Son 3 tracker.yml calismasi 10 dk altinda ust uste <b>basarisiz</b> oldu.\n" +
                   `Son fail: ${lastFailTime}\n\n` +
                   "Olasi nedenler:\n" +
-                  "• Ev PC kapali veya proxy erisilemez\n" +
+                  "• Ev PC kapali/uykuda veya proxy erisilemez\n" +
                   "• Oturum cookie'leri suresi dolmus\n" +
                   "• WAF/Captcha engeli\n\n" +
                   "Bot otomatik yeniden baslatilmayacak. " +
@@ -88,6 +107,10 @@ jobs:
                 } catch (e) {
                   console.log(`Telegram gonderim hatasi: ${e}`);
                 }
+              } else {
+                console.log(
+                  `Son fail ${Math.round(minsSinceLastFail)} dk onceydi; tekrarli Telegram uyarisi atlandi.`
+                );
               }
               return;
             }

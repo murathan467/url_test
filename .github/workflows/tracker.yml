@@ -29,7 +29,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: store-tracker-24-7
+  group: ${{ (inputs.stores == '' || inputs.stores == 'all') && 'store-tracker-24-7' || format('store-tracker-{0}', inputs.stores) }}
   cancel-in-progress: false
 
 jobs:
@@ -163,11 +163,37 @@ jobs:
         env:
           HOME_PROXY_URL: ${{ secrets.HOME_PROXY_URL }}
         run: |
-          EXIT_IP=$(curl -fsS --max-time 12 -x "$HOME_PROXY_URL" https://api.ipify.org) || {
-            echo "::error::Ev PC proxy erisilemedi (PC kapali veya internet yok). Azure IP ile devam edilmeyecek."
+          if [ -z "$HOME_PROXY_URL" ]; then
+            echo "::error::HOME_PROXY_URL secret tanimli degil."
             exit 78
-          }
-          echo "✅ Ev proxy aktif. Cikis IP: $EXIT_IP"
+          fi
+
+          EXIT_IP=""
+          CHECK_URLS=("https://api.ipify.org" "https://icanhazip.com" "https://ifconfig.me/ip")
+          for attempt in 1 2 3; do
+            for url in "${CHECK_URLS[@]}"; do
+              CANDIDATE="$(curl -fsS --connect-timeout 8 --max-time 15 -x "$HOME_PROXY_URL" "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+              if echo "$CANDIDATE" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+                EXIT_IP="$CANDIDATE"
+                break 2
+              fi
+            done
+            echo "Proxy dogrulama denemesi ${attempt}/3 basarisiz; 5 sn sonra tekrar deneniyor..."
+            sleep 5
+          done
+
+          if [ -z "$EXIT_IP" ]; then
+            echo "::error::Ev PC proxy 3 denemede erisilemedi (PC kapali/uykuda, Docker kapali veya internet yok). Azure IP ile devam edilmeyecek."
+            tailscale status 2>/dev/null | head -n 10 | sed -E 's/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' || true
+            exit 78
+          fi
+
+          echo "::add-mask::$EXIT_IP"
+          MASKED_IP="$(echo "$EXIT_IP" | awk -F. '{print $1"."$2".x.x"}')"
+          echo "✅ Ev proxy aktif. Cikis IP (maskeli): ${MASKED_IP}"
+          if [[ "$EXIT_IP" == 104.28.* ]]; then
+            echo "::warning::Cikis IP Cloudflare WARP araliginda (${MASKED_IP}). Ev PC'de WARP aciksa kapatmaniz onerilir."
+          fi
 
       - name: Guvenli calisma suresini hesapla
         id: budget

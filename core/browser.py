@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import random
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from patchright.async_api import Browser, BrowserContext, Locator, Page, Playwright, Route
 from config import get_storage_state_path
 
@@ -13,12 +13,33 @@ def get_proxy_config() -> dict | None:
     if not raw:
         return None
     parsed = urlparse(raw)
-    config: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        config["username"] = parsed.username
-    if parsed.password:
-        config["password"] = parsed.password
+    if not parsed.scheme or not parsed.hostname:
+        print("[UYARI] HOME_PROXY_URL geçersiz formatta; proxy devre dışı bırakıldı.")
+        return None
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    server = f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
+    config: dict = {"server": server}
+    if parsed.username is not None:
+        config["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        config["password"] = unquote(parsed.password)
     return config
+
+
+def _mask_proxy_server(server: str) -> str:
+    """Mask proxy hostname/IP so public GitHub Actions logs never leak Tailscale addresses."""
+    parsed = urlparse(server)
+    host = parsed.hostname or ""
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        masked_host = f"{parts[0]}.x.x.{parts[3]}"
+    elif host:
+        masked_host = f"{host[:2]}***"
+    else:
+        masked_host = "***"
+    port_part = f":{parsed.port}" if parsed.port else ""
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{masked_host}{port_part}"
 
 
 async def _block_heavy_resources(route: Route) -> None:
@@ -76,9 +97,10 @@ async def launch_store_browser(
     proxy_cfg = get_proxy_config()
     if proxy_cfg:
         context_kwargs["proxy"] = proxy_cfg
+        auth_label = "kimlik doğrulamalı" if proxy_cfg.get("username") else "kimliksiz"
         print(
             f"[{store_name.upper()}] Ev proxy'si aktif: "
-            f"{proxy_cfg['server']} (kullanıcı: {proxy_cfg.get('username', '-')})"
+            f"{_mask_proxy_server(proxy_cfg['server'])} ({auth_label})"
         )
 
     valid_state = _load_valid_storage_state(state_path)
@@ -87,7 +109,6 @@ async def launch_store_browser(
         print(f"[{store_name.upper()}] Kayıtlı oturum dosyası yüklendi: {valid_state}")
 
     context = await browser.new_context(**context_kwargs)
-    await context.route("**/*", _block_heavy_resources)
     return browser, context
 
 

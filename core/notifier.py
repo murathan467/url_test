@@ -1,8 +1,10 @@
 import html
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import requests
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, MAX_ALERTS_PER_WAVE
 
 TELEGRAM_MAX_LEN = 4000
+_VARIANT_QUERY_KEYS = {"c", "v1", "color"}
 
 
 def _split_message(message: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -74,11 +76,25 @@ class StockWaveNotifier:
 
     @staticmethod
     def _clean_url(url: str) -> str:
-        return url.split("?")[0].strip()
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        parts = urlsplit(raw)
+        kept = sorted(
+            (k, v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=False)
+            if k.lower() in _VARIANT_QUERY_KEYS
+        )
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), ""))
 
-    def process_cycle(self, matched_products: list[dict]) -> None:
+    def process_cycle(
+        self,
+        matched_products: list[dict],
+        uncertain_urls: set[str] | None = None,
+    ) -> None:
         """Evaluate current cycle matches and send wave alerts or out-of-stock resets."""
         current_map = {self._clean_url(p["url"]): p for p in matched_products}
+        uncertain_clean = {self._clean_url(u) for u in (uncertain_urls or set()) if u}
         in_stock_alerts: list[tuple[dict, int]] = []
         out_of_stock_alerts: list[dict] = []
 
@@ -108,7 +124,7 @@ class StockWaveNotifier:
 
         # 2. Önceki turda stokta olup bu turda stoğu/indirimi biten ürünleri tespit et
         for clean_url, state in list(self.states.items()):
-            if clean_url not in current_map and state["in_stock"]:
+            if clean_url not in current_map and clean_url not in uncertain_clean and state["in_stock"]:
                 state["in_stock"] = False
                 state["count"] = 0  # Tekrar stoğa girerse baştan 3 kere atabilsin
                 out_of_stock_alerts.append(state)
