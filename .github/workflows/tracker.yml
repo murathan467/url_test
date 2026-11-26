@@ -1,5 +1,5 @@
 name: Zara, Mango & Oxxo Takip Botu
-run-name: ${{ (inputs.stores == '' || inputs.stores == 'all') && inputs.max_run_minutes == '' && format('7/24 Takip Zinciri (Tur #{0})', inputs.chain_depth || '1') || format('Manuel Test ({0}{1})', inputs.stores || 'all', inputs.max_run_minutes != '' && format(', {0}dk', inputs.max_run_minutes) || '') }}
+run-name: "${{ (inputs.stores == '' || inputs.stores == 'all') && inputs.max_run_minutes == '' && format('7/24 Takip Zinciri (Tur {0})', inputs.chain_depth || '1') || format('Manuel Test ({0}{1})', inputs.stores || 'all', inputs.max_run_minutes != '' && format(', {0}dk', inputs.max_run_minutes) || '') }}"
 
 on:
   workflow_dispatch:
