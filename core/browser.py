@@ -7,21 +7,30 @@ from patchright.async_api import Browser, BrowserContext, Locator, Page, Playwri
 from config import get_storage_state_path
 
 
+_ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4"}
+
+
 def get_proxy_config() -> dict | None:
     """Parse HOME_PROXY_URL env var into a Playwright proxy dict, or None if unset."""
     raw = os.getenv("HOME_PROXY_URL", "").strip()
     if not raw:
         return None
     parsed = urlparse(raw)
-    if not parsed.scheme or not parsed.hostname:
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_PROXY_SCHEMES or not parsed.hostname:
         print("[UYARI] HOME_PROXY_URL geçersiz formatta; proxy devre dışı bırakıldı.")
         return None
+    try:
+        port = parsed.port
+    except ValueError:
+        print("[UYARI] HOME_PROXY_URL port değeri geçersiz; proxy devre dışı bırakıldı.")
+        return None
     host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    server = f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
+    server = f"{scheme}://{host}:{port}" if port is not None else f"{scheme}://{host}"
     config: dict = {"server": server}
-    if parsed.username is not None:
+    if parsed.username:
         config["username"] = unquote(parsed.username)
-    if parsed.password is not None:
+    if parsed.password:
         config["password"] = unquote(parsed.password)
     return config
 
@@ -33,12 +42,19 @@ def _mask_proxy_server(server: str) -> str:
     parts = host.split(".")
     if len(parts) == 4 and all(p.isdigit() for p in parts):
         masked_host = f"{parts[0]}.x.x.{parts[3]}"
+    elif ":" in host:
+        first_seg = host.split(":", 1)[0] or "ip6"
+        masked_host = f"[{first_seg}::***]"
     elif host:
-        masked_host = f"{host[:2]}***"
+        masked_host = f"{host[:2]}***" if len(host) > 2 else "***"
     else:
         masked_host = "***"
-    port_part = f":{parsed.port}" if parsed.port else ""
-    scheme = parsed.scheme or "http"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    port_part = f":{port}" if port is not None else ""
+    scheme = (parsed.scheme or "http").lower()
     return f"{scheme}://{masked_host}{port_part}"
 
 
@@ -61,7 +77,11 @@ def _load_valid_storage_state(state_path: str) -> str | None:
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and "cookies" in data:
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("cookies"), list)
+            and ("origins" not in data or isinstance(data["origins"], list))
+        ):
             return state_path
     except Exception as exc:
         print(f"[UYARI] Geçersiz oturum dosyası ({state_path}), sıfırdan başlanacak: {exc}")
@@ -71,7 +91,7 @@ def _load_valid_storage_state(state_path: str) -> str | None:
 async def launch_store_browser(
     playwright: Playwright, store_name: str
 ) -> tuple[Browser, BrowserContext]:
-    """Launch headed Chromium (for Xvfb) with tr-TR locale and resource blocking."""
+    """Launch headed Chromium (for Xvfb) with tr-TR locale and optional masked home proxy."""
     launch_kwargs: dict = {
         "headless": False,
         "args": [

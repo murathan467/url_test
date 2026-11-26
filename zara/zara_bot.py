@@ -75,8 +75,8 @@ async def handle_country_and_cookies(page: Page) -> None:
         print(f"[Zara] Hata diyaloğu kapatıldı ({matched_dialog}).")
 
 
-async def has_block_or_captcha(page: Page) -> bool:
-    """Detect WAF blocks or CAPTCHA overlays without attempting to bypass them."""
+async def detect_block_or_captcha(page: Page) -> str | None:
+    """Detect WAF blocks or CAPTCHA overlays and return the matched reason without bypassing."""
     block_markers = (
         "access denied",
         "bir sorun oluştu",
@@ -86,22 +86,64 @@ async def has_block_or_captcha(page: Page) -> bool:
     )
     try:
         title = _normalize_tr_lower(await page.title() or "")
-        if any(marker in title for marker in ("access denied", "attention required")):
-            return True
+        for marker in ("access denied", "attention required"):
+            if marker in title:
+                return f"title:{marker}"
     except Exception:
         pass
     try:
         text = _normalize_tr_lower(await page.locator("body").inner_text(timeout=2500))
-        if any(marker in text for marker in block_markers):
-            return True
-        captcha_count = await page.locator(
-            "iframe[src*='captcha'], iframe[src*='arkose'], iframe[title*='reCAPTCHA'], #sec-overlay"
-        ).count()
-        if captcha_count > 0:
-            return True
+        for marker in block_markers:
+            if marker in text:
+                return f"text:{marker}"
+        for sel in (
+            "#sec-overlay",
+            "iframe[src*='captcha']",
+            "iframe[src*='arkose']",
+            "iframe[title*='reCAPTCHA']",
+        ):
+            loc = page.locator(sel)
+            count = await loc.count()
+            if count > 0:
+                vis = False
+                try:
+                    vis = await loc.first.is_visible(timeout=300)
+                except Exception:
+                    pass
+                return f"selector:{sel}(count={count},visible={vis})"
     except Exception:
         pass
-    return False
+    return None
+
+
+async def has_block_or_captcha(page: Page) -> bool:
+    """Detect WAF blocks or CAPTCHA overlays without attempting to bypass them."""
+    return (await detect_block_or_captcha(page)) is not None
+
+
+async def _safe_page_diagnostics(page: Page) -> str:
+    """Return page_diagnostics with OAuth/query params stripped on account.zara.com URLs."""
+    diag = await page_diagnostics(page)
+    if "url=https://account.zara.com/" in diag and "?" in diag:
+        prefix, rest = diag.split("?", 1)
+        if " | " in rest:
+            _, tail = rest.split(" | ", 1)
+            return f"{prefix}?<redacted> | {tail}"
+    return diag
+
+
+async def _clear_stale_session_state(context: BrowserContext, page: Page) -> None:
+    """Clear expired cookies and web storage before starting a fresh login flow."""
+    try:
+        await context.clear_cookies()
+    except Exception as exc:
+        print(f"[UYARI] Zara eski çerezleri temizlenemedi: {exc}")
+    try:
+        await page.evaluate(
+            "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }"
+        )
+    except Exception:
+        pass
 
 
 async def _inspect_zara_page(page: Page) -> dict:
@@ -359,15 +401,16 @@ async def _zara_dom_diagnostics(page: Page) -> str:
 async def _wait_for_zara_wishlist_ready(
     page: Page,
     monitor: _ZaraNetworkMonitor | None = None,
-    timeout_ms: int = 10000,
+    timeout_ms: int = 12000,
 ) -> dict:
-    """Wait until Zara wishlist SPA hydrates (products, login CTA, empty text, or API rejection)."""
+    """Wait until Zara wishlist SPA hydrates without exiting early on SSR login/empty shells."""
     try:
         await page.wait_for_load_state("networkidle", timeout=min(5000, timeout_ms))
     except Exception:
         pass
 
     deadline = time.monotonic() + (timeout_ms / 1000.0)
+    api_ok_seen_at: float | None = None
     last_state: dict | None = None
     while True:
         last_state = await _inspect_zara_page(page)
@@ -375,11 +418,19 @@ async def _wait_for_zara_wishlist_ready(
             last_state["total_product_links"] > 0
             or last_state["has_login_url"]
             or last_state["has_login_form"]
-            or last_state["has_login_cta_in_main"]
-            or last_state["has_empty_wishlist_text"]
             or (monitor is not None and monitor.has_auth_failure())
         ):
             return last_state
+
+        if monitor is not None and monitor.wishlist_api_succeeded():
+            if last_state["has_empty_wishlist_text"]:
+                return last_state
+            now = time.monotonic()
+            if api_ok_seen_at is None:
+                api_ok_seen_at = now
+            elif (now - api_ok_seen_at) >= 1.5:
+                return last_state
+
         if await has_block_or_captcha(page):
             return last_state
         if time.monotonic() >= deadline:
@@ -433,7 +484,7 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             await page.wait_for_timeout(2000)
             await handle_country_and_cookies(page)
 
-        state = await _wait_for_zara_wishlist_ready(page, monitor=monitor, timeout_ms=10000)
+        state = await _wait_for_zara_wishlist_ready(page, monitor=monitor, timeout_ms=12000)
         diag = await page_diagnostics(page)
         print(
             f"[Zara] İlk sayfa kontrolü -> {diag} | tr={state['is_tr_store']} "
@@ -468,7 +519,8 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
         print("[HATA] COMMON_EMAIL veya COMMON_PASSWORD eksik.")
         return False
 
-    print("[Zara] Oturum kapalı, otomatik giriş başlatılıyor...")
+    print("[Zara] Oturum kapalı, süresi dolmuş çerezler temizlenip otomatik giriş başlatılıyor...")
+    await _clear_stale_session_state(context, page)
     post_monitor = _ZaraNetworkMonitor(page, capture_details=True)
     try:
         await safe_goto(page, ZARA_HOME_URL, timeout_ms=35000, retries=2)
@@ -490,12 +542,17 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             await safe_goto(page, ZARA_LOGIN_URL, timeout_ms=35000, retries=2)
             await page.wait_for_timeout(3000)
 
+        try:
+            await page.wait_for_load_state("networkidle", timeout=6000)
+        except Exception:
+            pass
         await handle_country_and_cookies(page)
 
-        if await has_block_or_captcha(page):
+        block_reason = await detect_block_or_captcha(page)
+        if block_reason:
             print(
-                "[HATA] Zara giriş sayfasında Captcha/WAF/Inditex HLP engeli çıktı "
-                f"-> {await page_diagnostics(page)}"
+                f"[HATA] Zara giriş sayfasında Captcha/WAF/Inditex HLP engeli çıktı "
+                f"(neden={block_reason}) -> {await _safe_page_diagnostics(page)}"
             )
             return False
 
@@ -524,15 +581,18 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             post_wait_ms=4000,
         )
         if not submitted_email:
-            print(f"[HATA] Zara e-posta devam butonu bulunamadı -> {await page_diagnostics(page)}")
+            print(
+                f"[HATA] Zara e-posta devam butonu bulunamadı -> {await _safe_page_diagnostics(page)}"
+            )
             return False
 
         await handle_country_and_cookies(page)
 
-        if await has_block_or_captcha(page):
+        email_block_reason = await detect_block_or_captcha(page)
+        if email_block_reason:
             print(
-                "[HATA] E-posta adımında Captcha/WAF veya 'Bir sorun oluştu' tetiklendi "
-                f"-> {await page_diagnostics(page)}"
+                f"[HATA] E-posta adımında Captcha/WAF veya 'Bir sorun oluştu' tetiklendi "
+                f"(neden={email_block_reason}) -> {await _safe_page_diagnostics(page)}"
             )
             return False
 
@@ -570,15 +630,18 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             post_wait_ms=2000,
         )
         if not submitted_login:
-            print(f"[HATA] Zara şifre giriş butonu bulunamadı -> {await page_diagnostics(page)}")
+            print(
+                f"[HATA] Zara şifre giriş butonu bulunamadı -> {await _safe_page_diagnostics(page)}"
+            )
             return False
 
         await _wait_for_login_redirect(page, timeout_ms=12000)
 
-        if await has_block_or_captcha(page):
+        pwd_block_reason = await detect_block_or_captcha(page)
+        if pwd_block_reason:
             print(
-                "[HATA] Şifre adımında Captcha/WAF veya 'Bir sorun oluştu' tetiklendi "
-                f"-> {await page_diagnostics(page)}"
+                f"[HATA] Şifre adımında Captcha/WAF veya 'Bir sorun oluştu' tetiklendi "
+                f"(neden={pwd_block_reason}) -> {await _safe_page_diagnostics(page)}"
             )
             return False
 
@@ -594,11 +657,11 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             await handle_country_and_cookies(page)
 
         post_state = await _wait_for_zara_wishlist_ready(
-            page, monitor=post_monitor, timeout_ms=10000
+            page, monitor=post_monitor, timeout_ms=12000
         )
         if post_monitor.has_auth_failure() or not await _is_zara_session_active(page, post_state):
             print(
-                f"[HATA] Zara girişi tamamlanamadı -> {await page_diagnostics(page)} | "
+                f"[HATA] Zara girişi tamamlanamadı -> {await _safe_page_diagnostics(page)} | "
                 f"auth_err={post_monitor.auth_failures}"
             )
             return False

@@ -10,7 +10,6 @@ async def _run_store(store: str) -> bool:
     from core.browser import launch_store_browser
     from core.session import (
         clear_session_valid_marker,
-        has_valid_session_marker,
         save_store_session,
     )
     from mango.mango_bot import run_mango_loop
@@ -29,12 +28,14 @@ async def _run_store(store: str) -> bool:
             elif store == "oxxo":
                 ok = await run_oxxo_loop(context, MAX_RUN_MINUTES)
         finally:
-            if ok or has_valid_session_marker(store):
+            if ok:
                 await save_store_session(context, store, mark_valid=True)
             else:
+                clear_session_valid_marker(store)
                 print(
-                    f"[UYARI] [{store.upper()}] Oturum doğrulanamadığı için mevcut "
-                    "storage_state kaydedilmedi (cache zehirlenmesi önlendi)."
+                    f"[UYARI] [{store.upper()}] Çalışma başarısız/kesintili bittiği için "
+                    "mevcut storage_state kaydedilmedi ve geçerlilik işaretçisi temizlendi "
+                    "(cache zehirlenmesi önlendi)."
                 )
             try:
                 await context.close()

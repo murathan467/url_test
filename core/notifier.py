@@ -4,11 +4,33 @@ import requests
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, MAX_ALERTS_PER_WAVE
 
 TELEGRAM_MAX_LEN = 4000
-_VARIANT_QUERY_KEYS = {"c", "v1", "color"}
+_VARIANT_QUERY_KEYS = {"c", "v1", "color", "colorid", "colour", "renk"}
+
+
+def _split_oversized_block(block: str, limit: int) -> list[str]:
+    """Split an oversized block at line boundaries before falling back to hard slicing."""
+    chunks: list[str] = []
+    current = ""
+    for line in block.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            if len(line) <= limit:
+                current = line
+            else:
+                for i in range(0, len(line), limit):
+                    chunks.append(line[i : i + limit])
+                current = ""
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _split_message(message: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
-    """Split oversized HTML messages at paragraph boundaries to stay within Telegram limits."""
+    """Split oversized HTML messages at paragraph/line boundaries to stay within Telegram limits."""
     if len(message) <= limit:
         return [message]
 
@@ -24,8 +46,7 @@ def _split_message(message: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
             if len(block) <= limit:
                 current = block
             else:
-                for i in range(0, len(block), limit):
-                    chunks.append(block[i : i + limit])
+                chunks.extend(_split_oversized_block(block, limit))
                 current = ""
     if current:
         chunks.append(current)
@@ -81,11 +102,15 @@ class StockWaveNotifier:
             return ""
         parts = urlsplit(raw)
         kept = sorted(
-            (k, v)
-            for k, v in parse_qsl(parts.query, keep_blank_values=False)
-            if k.lower() in _VARIANT_QUERY_KEYS
+            {
+                (k.lower(), v)
+                for k, v in parse_qsl(parts.query, keep_blank_values=False)
+                if k.lower() in _VARIANT_QUERY_KEYS
+            }
         )
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), ""))
+        return urlunsplit(
+            (parts.scheme.lower(), parts.netloc.lower(), parts.path, urlencode(kept), "")
+        )
 
     def process_cycle(
         self,

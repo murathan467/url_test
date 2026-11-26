@@ -28,10 +28,20 @@ STORE_FAVORITES = {
 }
 
 
-def _verify_favorites_page(page, store: str) -> tuple[bool, str]:
-    """Wait briefly for SPA hydration on favorites and verify that the session looks active."""
-    deadline = time.monotonic() + 10.0
+def _verify_favorites_page(
+    page, store: str, timeout_sec: float = 10.0, login_cta_grace_sec: float = 4.5
+) -> tuple[bool, str]:
+    """Wait for SPA hydration on favorites and verify that the session looks active.
+
+    Does not abort on transient SSR login CTAs during initial hydration (e.g. Zara
+    renders nav-to-login before /user/oauth2/refresh finishes); only fails once a
+    login URL redirect occurs or login CTA/form persists past the grace window.
+    """
+    start = time.monotonic()
+    deadline = start + timeout_sec
     last_summary = ""
+    last_has_login_cta = False
+    last_has_login_form = False
     while time.monotonic() < deadline:
         url = (page.url or "").lower()
         if any(tok in url for tok in ("logon", "login", "signin", "account.zara.com")):
@@ -43,39 +53,48 @@ def _verify_favorites_page(page, store: str) -> tuple[bool, str]:
                     const norm = (s) => (s || "").replace(/[İIı]/g, "i").toLowerCase().replace(/\\u0307/g, "");
                     const mainEl = document.querySelector('main, [role="main"]') || document.body;
                     const txt = norm(mainEl ? mainEl.innerText : "");
+                    const hasLoginForm = !!document.querySelector('input[type="password"]');
                     const hasNavLogin = !!document.querySelector(
-                        '[data-qa-action="nav-to-login"], [data-qa-id="nav-to-login"], input[type="password"]'
+                        '[data-qa-action="nav-to-login"], [data-qa-id="nav-to-login"]'
                     );
                     const prodCount = document.querySelectorAll(
                         'a[href*="-p"], a[href*="/p/"], .FollowListItems, .ProductItemWrapper'
                     ).length;
                     const hasLoginCta = prodCount === 0 && (
+                        hasLoginForm ||
                         hasNavLogin ||
                         ["giriş yap", "oturum aç", "oturum açmalısınız", "log in", "sign in"]
                             .map(norm)
                             .some(k => txt.includes(k))
                     );
-                    return { prodCount, hasLoginCta };
+                    return { prodCount, hasLoginCta, hasLoginForm };
                 }
                 """
             )
             prod_count = int(state.get("prodCount", 0))
-            has_login_cta = bool(state.get("hasLoginCta", False))
-            last_summary = f"url={page.url} urun_link={prod_count} login_cta={has_login_cta}"
+            last_has_login_cta = bool(state.get("hasLoginCta", False))
+            last_has_login_form = bool(state.get("hasLoginForm", False))
+            last_summary = f"url={page.url} urun_link={prod_count} login_cta={last_has_login_cta}"
             if prod_count > 0:
                 page.wait_for_timeout(1000)
                 return True, last_summary
-            if has_login_cta:
+            if last_has_login_form:
+                return False, f"Sayfada giriş formu görünüyor ({last_summary})"
+            if last_has_login_cta and (time.monotonic() - start) >= login_cta_grace_sec:
                 return False, f"Sayfada giriş çağrısı görünüyor ({last_summary})"
         except Exception:
             pass
         page.wait_for_timeout(500)
+
+    if last_has_login_cta or last_has_login_form:
+        return False, f"Sayfada giriş çağrısı görünüyor ({last_summary})"
     return True, last_summary or f"url={page.url}"
 
 
 def export_session(store: str, reuse_existing: bool = False, upload_secret: bool = False) -> None:
     """Open headed browser for manual login and export storage_state JSON + Base64."""
     from patchright.sync_api import sync_playwright
+    from core.browser import _load_valid_storage_state
 
     login_url = STORE_URLS[store]
     state_path = get_storage_state_path(store)
@@ -102,12 +121,15 @@ def export_session(store: str, reuse_existing: bool = False, upload_secret: bool
             "locale": "tr-TR",
             "timezone_id": "Europe/Istanbul",
         }
-        if reuse_existing and os.path.exists(state_path) and os.path.getsize(state_path) > 0:
-            context_kwargs["storage_state"] = state_path
-            print(f"[BİLGİ] Mevcut oturum dosyası tekrar yüklendi: {state_path}")
+        if reuse_existing:
+            valid_state = _load_valid_storage_state(state_path)
+            if valid_state:
+                context_kwargs["storage_state"] = valid_state
+                print(f"[BİLGİ] Mevcut oturum dosyası tekrar yüklendi: {valid_state}")
 
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
+        verified = True
         try:
             page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
             input("\n[BEKLENİYOR] Giriş tamamlandıysa ENTER tuşuna basın...")
@@ -125,6 +147,7 @@ def export_session(store: str, reuse_existing: bool = False, upload_secret: bool
                             "   Giriş tamamlanmadıysa tarayıcıyı kapatıp tekrar deneyin."
                         )
                 except Exception as e:
+                    verified = False
                     print(f"Uyarı: Favoriler açılırken hata: {e}")
 
             context.storage_state(path=state_path)
@@ -138,7 +161,12 @@ def export_session(store: str, reuse_existing: bool = False, upload_secret: bool
             print(f"✅ Base64 çıktı kaydedildi: {b64_path}")
 
             if upload_secret:
-                if shutil.which("gh"):
+                if not verified:
+                    print(
+                        f"⚠️ Oturum doğrulanamadığı için {secret_name} otomatik yüklenmedi "
+                        "(mevcut çalışan Secret korunuyor)."
+                    )
+                elif shutil.which("gh"):
                     res = subprocess.run(
                         ["gh", "secret", "set", secret_name],
                         input=encoded,
@@ -184,6 +212,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--upload-secret",
+        "--set-gh-secret",
+        dest="upload_secret",
         action="store_true",
         help="Dışa aktarılan Base64 oturumu 'gh secret set' ile doğrudan GitHub Secrets'a yükle.",
     )

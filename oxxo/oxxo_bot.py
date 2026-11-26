@@ -97,6 +97,21 @@ async def _inspect_oxxo_page(page: Page) -> dict:
     }
 
 
+async def _clear_stale_session_state(context: BrowserContext, page: Page) -> None:
+    """Clear expired/corrupt cookies and web storage before starting a fresh login."""
+    try:
+        await context.clear_cookies()
+    except Exception as exc:
+        print(f"[UYARI] Oxxo eski çerezler temizlenemedi: {exc}")
+    try:
+        if not page.is_closed():
+            await page.evaluate(
+                "() => { try { localStorage.clear(); } catch (e) {} try { sessionStorage.clear(); } catch (e) {} }"
+            )
+    except Exception:
+        pass
+
+
 async def ensure_oxxo_login(context: BrowserContext, page: Page) -> bool:
     """Verify Oxxo session on FollowList or attempt login when no CAPTCHA blocks it."""
     try:
@@ -134,7 +149,8 @@ async def ensure_oxxo_login(context: BrowserContext, page: Page) -> bool:
         print("[HATA] COMMON_EMAIL veya COMMON_PASSWORD eksik.")
         return False
 
-    print("[Oxxo] Oturum kapalı, otomatik giriş başlatılıyor...")
+    print("[Oxxo] Oturum kapalı, eski çerezler temizlenip otomatik giriş başlatılıyor...")
+    await _clear_stale_session_state(context, page)
     try:
         await safe_goto(page, OXXO_LOGIN_URL, timeout_ms=30000, retries=2)
         await page.wait_for_timeout(3000)
@@ -419,11 +435,11 @@ async def run_oxxo_loop(context: BrowserContext, max_run_minutes: int) -> bool:
             print(f"\n[OXXO — Tur #{cycle}] Takip listesi yenileniyor...")
 
             try:
+                needs_navigation = cycle > 1
                 if favorites_page.is_closed():
                     print("[UYARI] Oxxo takip listesi sekmesi kapanmış, yeniden açılıyor...")
                     favorites_page = await context.new_page()
-                    await safe_goto(favorites_page, OXXO_FAVORITES_URL, timeout_ms=30000, retries=2)
-                    await favorites_page.wait_for_timeout(2500)
+                    needs_navigation = True
                 elif cycle > 1 and cycle % RECYCLE_TAB_EVERY_CYCLES == 0:
                     print("[Oxxo] Bellek temizliği için takip listesi sekmesi yenileniyor...")
                     try:
@@ -431,17 +447,9 @@ async def run_oxxo_loop(context: BrowserContext, max_run_minutes: int) -> bool:
                     except Exception:
                         pass
                     favorites_page = await context.new_page()
-                    if not await safe_reload_or_goto(
-                        favorites_page, OXXO_FAVORITES_URL, timeout_ms=30000
-                    ):
-                        consecutive_reload_failures += 1
-                        remaining = max_seconds - (time.time() - start_time)
-                        if remaining <= REFRESH_INTERVAL:
-                            break
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-                    await favorites_page.wait_for_timeout(2500)
-                elif cycle > 1:
+                    needs_navigation = True
+
+                if needs_navigation:
                     ok = await safe_reload_or_goto(
                         favorites_page, OXXO_FAVORITES_URL, timeout_ms=30000
                     )

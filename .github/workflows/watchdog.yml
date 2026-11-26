@@ -42,11 +42,13 @@ jobs:
 
             // --- Ardisik kisa/tam cokme korumasi ---
             // Not: OXXO/Mango 5.5 saat calisip tek bir magaza fail oldugunda workflow 'failure'
-            // gorunse bile gercek bir sonsuz fail dongusu degildir; yalnizca <10 dk icinde
-            // ust uste 3 kez tam coken kosularda devre kesici tetiklenir.
+            // gorunse bile gercek bir sonsuz fail dongusu degildir. Ayrica tekil magaza manuel
+            // test kosulari (stores != 'all' veya max_run_minutes != '') retrigger job'unu
+            // 'skipped' biraktigi icin devre kesiciye sayilmamalidir; yalnizca tam 7/24
+            // kosularinda <10 dk icinde ust uste 3 kez cokme oldugunda devre kesici tetiklenir.
             const completedRuns = runsData.workflow_runs
               .filter((r) => r.status === "completed")
-              .slice(0, 3);
+              .slice(0, 10);
 
             const isShortFailure = (r) => {
               if (r.conclusion !== "failure") return false;
@@ -56,19 +58,57 @@ jobs:
               return durSec < 600;
             };
 
-            const allShortFailed = completedRuns.length >= 3 &&
-              completedRuns.every(isShortFailure);
+            const isFullChainRun = async (r) => {
+              try {
+                const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: r.id,
+                  per_page: 20,
+                });
+                const retriggerJob = jobsData.jobs.find((j) =>
+                  (j.name || "").includes("Sonraki 7/24 Turu")
+                );
+                // Tekil magaza / kisa test kosularinda retrigger job'u 'skipped' olur.
+                if (retriggerJob && retriggerJob.conclusion === "skipped") {
+                  return false;
+                }
+                return true;
+              } catch (e) {
+                console.log(`Job bilgisi alinamadi (run_id=${r.id}): ${e}`);
+                return true;
+              }
+            };
+
+            const recentFullRuns = [];
+            for (const run of completedRuns) {
+              if (recentFullRuns.length >= 3) break;
+              if (isShortFailure(run)) {
+                if (await isFullChainRun(run)) {
+                  recentFullRuns.push(run);
+                } else {
+                  console.log(
+                    `Tekil/kisa test kosusu devre kesici hesabindan haric tutuldu (run_id=${run.id}).`
+                  );
+                }
+              } else {
+                recentFullRuns.push(run);
+              }
+            }
+
+            const allShortFailed = recentFullRuns.length >= 3 &&
+              recentFullRuns.every(isShortFailure);
 
             if (allShortFailed) {
               console.log(
-                "Son 3 tracker.yml calismasi 10 dk altinda ust uste basarisiz. " +
+                "Son 3 tam 7/24 tracker.yml calismasi 10 dk altinda ust uste basarisiz. " +
                 "Sonsuz fail dongusu onleniyor; yeni tetikleme ATLANDI."
               );
 
               // Telegram uyarisini yalnizca son fail tazeyse (son 35 dk icinde) gonder;
               // her 30 dk'lik cron turunda tekrar spam atilmasini onle.
-              const lastFailMs = completedRuns[0]
-                ? new Date(completedRuns[0].updated_at || completedRuns[0].created_at).getTime()
+              const lastFailMs = recentFullRuns[0]
+                ? new Date(recentFullRuns[0].updated_at || recentFullRuns[0].created_at).getTime()
                 : 0;
               const minsSinceLastFail = lastFailMs
                 ? (Date.now() - lastFailMs) / 60000
@@ -77,8 +117,8 @@ jobs:
               const token = process.env.TELEGRAM_TOKEN || "";
               const chatId = process.env.TELEGRAM_CHAT_ID || "";
               if (token && chatId && minsSinceLastFail <= 35) {
-                const lastFailTime = completedRuns[0]
-                  ? completedRuns[0].updated_at
+                const lastFailTime = recentFullRuns[0]
+                  ? recentFullRuns[0].updated_at
                   : "?";
                 const msg =
                   "⚠️ <b>GizIndirimBot Watchdog Uyarisi</b>\n\n" +

@@ -332,6 +332,21 @@ async def _is_mango_session_active(page: Page, state: dict) -> bool:
     )
 
 
+async def _clear_stale_session_state(context: BrowserContext, page: Page) -> None:
+    """Clear expired/corrupt cookies and web storage before starting a fresh login."""
+    try:
+        await context.clear_cookies()
+    except Exception as exc:
+        print(f"[UYARI] Mango eski çerezler temizlenemedi: {exc}")
+    try:
+        if not page.is_closed():
+            await page.evaluate(
+                "() => { try { localStorage.clear(); } catch (e) {} try { sessionStorage.clear(); } catch (e) {} }"
+            )
+    except Exception:
+        pass
+
+
 async def _ensure_mango_login_with_reason(
     context: BrowserContext, page: Page
 ) -> tuple[bool, str]:
@@ -393,7 +408,8 @@ async def _ensure_mango_login_with_reason(
         print("[HATA] COMMON_EMAIL veya COMMON_PASSWORD eksik.")
         return False, "missing_credentials"
 
-    print("[Mango] Oturum kapalı, otomatik giriş başlatılıyor...")
+    print("[Mango] Oturum kapalı, eski çerezler temizlenip otomatik giriş başlatılıyor...")
+    await _clear_stale_session_state(context, page)
     login_net_logs, stop_login_net_logger = _attach_mango_network_logger(page)
     try:
         await safe_goto(page, MANGO_LOGIN_URL, timeout_ms=30000, retries=2)
@@ -434,8 +450,10 @@ async def _ensure_mango_login_with_reason(
         await page.wait_for_timeout(800)
 
         await page.locator(
-            "button[id='login-form-submit-button'], button:has-text('OTURUM AÇ'), "
-            "button:has-text('Oturum aç'), button[type='submit']"
+            "button[id='login-form-submit-button']:visible, "
+            "form button:has-text('OTURUM AÇ'):visible, "
+            "form button:has-text('Oturum aç'):visible, "
+            "form button[type='submit']:visible"
         ).first.click()
         await page.wait_for_timeout(6000)
 
@@ -775,8 +793,8 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
         start_time = time.time()
         max_seconds = max_run_minutes * 60 if max_run_minutes > 0 else float("inf")
         cycle = 0
-        # Keep proxy + Mango Next.js concurrency bounded to 2 tabs to avoid proxy timeouts/WAF spikes.
-        sem = asyncio.Semaphore(2)
+        # Keep proxy + Mango Next.js concurrency bounded to 3 tabs (3 batches for 7 items -> ~30s cadence).
+        sem = asyncio.Semaphore(3)
         last_known_total = 0
         consecutive_empty_reads = 0
         consecutive_reload_failures = 0
@@ -789,10 +807,11 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
             print(f"\n[MANGO — Tur #{cycle}] Favoriler yenileniyor...")
 
             try:
+                needs_navigation = cycle > 1
                 if favorites_page.is_closed():
                     print("[UYARI] Mango favoriler sekmesi kapanmış, yeniden açılıyor...")
                     favorites_page = await context.new_page()
-                    await safe_goto(favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000, retries=2)
+                    needs_navigation = True
                 elif cycle > 1 and cycle % RECYCLE_TAB_EVERY_CYCLES == 0:
                     print("[Mango] Bellek temizliği için favoriler sekmesi yenileniyor...")
                     try:
@@ -800,16 +819,9 @@ async def run_mango_loop(context: BrowserContext, max_run_minutes: int) -> bool:
                     except Exception:
                         pass
                     favorites_page = await context.new_page()
-                    if not await safe_reload_or_goto(
-                        favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000
-                    ):
-                        consecutive_reload_failures += 1
-                        remaining = max_seconds - (time.time() - start_time)
-                        if remaining <= REFRESH_INTERVAL:
-                            break
-                        await asyncio.sleep(REFRESH_INTERVAL)
-                        continue
-                elif cycle > 1:
+                    needs_navigation = True
+
+                if needs_navigation:
                     if not await safe_reload_or_goto(
                         favorites_page, MANGO_FAVORITES_URL, timeout_ms=30000
                     ):
