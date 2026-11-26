@@ -102,15 +102,9 @@ async def detect_block_or_captcha(page: Page) -> str | None:
             "iframe[src*='arkose']",
             "iframe[title*='reCAPTCHA']",
         ):
-            loc = page.locator(sel)
-            count = await loc.count()
-            if count > 0:
-                vis = False
-                try:
-                    vis = await loc.first.is_visible(timeout=300)
-                except Exception:
-                    pass
-                return f"selector:{sel}(count={count},visible={vis})"
+            vis_count = await page.locator(f"{sel}:visible").count()
+            if vis_count > 0:
+                return f"selector:{sel}(visible_count={vis_count})"
     except Exception:
         pass
     return None
@@ -557,9 +551,10 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             return False
 
         email_input = page.locator(
-            "input[name='username']:visible, input[type='email']:visible, "
+            "input[type='email']:visible, input[name='username']:visible, "
             "input[name='email']:visible, input[name='logonId']:visible, "
-            "input[aria-label*='E-posta']:visible"
+            "input[autocomplete='username']:visible, input[id*='email' i]:visible, "
+            "input[aria-label*='e-posta' i]:visible, input[placeholder*='e-posta' i]:visible"
         ).first
         await email_input.wait_for(state="visible", timeout=15000)
         await human_type(email_input, COMMON_EMAIL)
@@ -578,7 +573,7 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
                 "button:has-text('CONTINUE')",
             ],
             timeout_ms=4000,
-            post_wait_ms=4000,
+            post_wait_ms=3500,
         )
         if not submitted_email:
             print(
@@ -586,6 +581,10 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             )
             return False
 
+        try:
+            await page.wait_for_load_state("networkidle", timeout=4000)
+        except Exception:
+            pass
         await handle_country_and_cookies(page)
 
         email_block_reason = await detect_block_or_captcha(page)
@@ -596,20 +595,41 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             )
             return False
 
-        pwd_link = page.get_by_text("Şifre ile giriş yap").or_(
-            page.get_by_text("Log in with password")
-        ).or_(page.get_by_text("Parola ile giriş yap")).first
+        pass_input = page.locator(
+            "input[type='password']:visible, input[name='password']:visible, "
+            "input[autocomplete='current-password']:visible, "
+            "input[aria-label*='parola' i]:visible, input[aria-label*='şifre' i]:visible, "
+            "input[aria-label*='password' i]:visible"
+        ).first
+        pass_already_visible = False
         try:
-            if await pwd_link.is_visible(timeout=2500):
-                await pwd_link.click()
-                await page.wait_for_timeout(1500)
+            pass_already_visible = await pass_input.is_visible(timeout=2000)
         except Exception:
             pass
 
-        pass_input = page.locator(
-            "input[name='password']:visible, input[type='password']:visible, "
-            "input[aria-label*='Parola']:visible, input[aria-label*='Password']:visible"
-        ).first
+        if not pass_already_visible:
+            pwd_switch = await click_first_visible(
+                page,
+                [
+                    "button:has-text('PAROLA İLE OTURUM AÇ')",
+                    "button:has-text('Parola ile oturum aç')",
+                    "button:has-text('ŞİFRE İLE OTURUM AÇ')",
+                    "button:has-text('Şifre ile oturum aç')",
+                    "button:has-text('ŞİFRE İLE GİRİŞ YAP')",
+                    "button:has-text('Şifre ile giriş yap')",
+                    "button:has-text('PAROLA İLE GİRİŞ YAP')",
+                    "button:has-text('Parola ile giriş yap')",
+                    "button:has-text('Log in with password')",
+                    "a:has-text('Şifre ile')",
+                    "a:has-text('Parola ile')",
+                    "a:has-text('Log in with password')",
+                ],
+                timeout_ms=1500,
+                post_wait_ms=1500,
+            )
+            if pwd_switch:
+                print(f"[Zara] Parola ile giriş seçeneğine geçildi ({pwd_switch}).")
+
         await pass_input.wait_for(state="visible", timeout=15000)
         await human_type(pass_input, COMMON_PASSWORD)
         await page.wait_for_timeout(800)
@@ -625,6 +645,8 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
                 "form button[data-qa-action='submit']",
                 "button.submit-button",
                 "main form button[type='submit']",
+                "button:has-text('OTURUM AÇ')",
+                "button:has-text('GİRİŞ YAP')",
             ],
             timeout_ms=4000,
             post_wait_ms=2000,
@@ -635,7 +657,7 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
             )
             return False
 
-        await _wait_for_login_redirect(page, timeout_ms=12000)
+        await _wait_for_login_redirect(page, timeout_ms=15000)
 
         pwd_block_reason = await detect_block_or_captcha(page)
         if pwd_block_reason:
@@ -670,7 +692,7 @@ async def ensure_zara_login(context: BrowserContext, page: Page) -> bool:
         await save_store_session(context, "zara", mark_valid=True)
         return True
     except Exception as exc:
-        print(f"[HATA] Zara login hatası: {exc}")
+        print(f"[HATA] Zara login hatası: {exc} -> {await _safe_page_diagnostics(page)}")
         return False
     finally:
         post_monitor.stop()

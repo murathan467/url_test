@@ -100,14 +100,22 @@ async def has_block_or_captcha(page: Page) -> bool:
         text = _norm_fold(await page.locator("body").inner_text(timeout=2500))
         if any(k in text for k in block_markers):
             return True
-        captcha_count = await page.locator(
-            "iframe[src*='captcha'], iframe[src*='arkose'], "
-            "iframe[title*='reCAPTCHA'], iframe[src*='turnstile'], #sec-overlay"
-        ).count()
-        if captcha_count > 0:
-            return True
     except Exception:
         pass
+    captcha_selectors = (
+        "iframe[src*='captcha']",
+        "iframe[src*='arkose']",
+        "iframe[title*='reCAPTCHA']",
+        "iframe[src*='turnstile']",
+        "#sec-overlay",
+    )
+    for sel in captcha_selectors:
+        try:
+            visible_loc = page.locator(f"{sel}:visible")
+            if await visible_loc.count() > 0 and await visible_loc.first.is_visible(timeout=250):
+                return True
+        except Exception:
+            continue
     return False
 
 
